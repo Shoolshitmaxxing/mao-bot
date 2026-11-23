@@ -1,9 +1,4 @@
-"""Spellogik för Mao. Inget Discord-beroende här, så den går att testa separat.
-
-Boten dömer ALDRIG själv: den lägger vilket kort som helst och håller inte koll på
-vems tur det är. Den håller reda på korten och låter regelhållarna (domarna) dela ut
-straffkort, med möjlighet att ta tillbaka det senaste draget.
-"""
+"""Spellogik för Mao. Inget Discord-beroende här, så den går att testa separat."""
 from __future__ import annotations
 
 import random
@@ -19,8 +14,9 @@ REASONS = ["Inte din tur", "Pratade", "Fel kort", "Glömde något", "Sa fel sak"
 
 # Hemliga effekter som regelhållaren kan koppla till en valör.
 EFFECTS = {
-    "draw1": "nästa spelare i cirkeln drar 1 kort",
-    "draw2": "nästa spelare i cirkeln drar 2 kort",
+    "skip": "nästa spelare hoppas över",
+    "reverse": "spelriktningen byts",
+    "draw2": "nästa spelare drar 2 kort och hoppas över",
 }
 
 
@@ -50,33 +46,22 @@ class Outcome:
 
 
 @dataclass
-class LastAction:
-    """Det senaste draget, så att det kan ångras om någon straffas för 'Inte din tur'."""
-    kind: str  # "play" | "draw" | "pass"
-    uid: int
-    card: Card | None = None
-    victim: int | None = None
-    victim_cards: list[Card] = field(default_factory=list)
-
-
-@dataclass
 class Game:
     channel_id: int
     host_id: int
-    players: list[int] = field(default_factory=list)  # i den ordning man "sitter i cirkeln"
+    players: list[int] = field(default_factory=list)
     names: dict[int, str] = field(default_factory=dict)
     keepers: set[int] = field(default_factory=set)  # regelhållare (får dela ut straff)
     hands: dict[int, list[Card]] = field(default_factory=dict)
     draw_pile: list[Card] = field(default_factory=list)
     pile: list[Card] = field(default_factory=list)
+    turn: int = 0
+    direction: int = 1
     started: bool = False
     finished: bool = False
     winner: int | None = None
     effects: dict[str, str] = field(default_factory=dict)  # valör -> effekt
-    last: LastAction | None = None
-    seq: int = 0  # räknas upp vid varje drag; knappar på gamla bordsmeddelanden blir ogiltiga
     table_msg: Any = None  # senaste bordsmeddelandet i Discord
-    hand_ix: dict[int, tuple[Any, int]] = field(default_factory=dict)  # spelare -> (interaction, sida) för live-uppdatering
 
     def __post_init__(self) -> None:
         self.keepers.add(self.host_id)
@@ -84,30 +69,32 @@ class Game:
     # ---------- uppställning ----------
     def add_player(self, uid: int, name: str) -> bool:
         self.names[uid] = name
-        if uid in self.players or (self.started and not self.finished):
+        if uid in self.players or self.started and not self.finished:
             return False
         self.players.append(uid)
         return True
 
-    def start(self, cards_each: int = 5) -> str | None:
-        """Blandar cirkelns ordning, delar ut och startar en runda. Returnerar felmeddelande eller None."""
+    def start(self, cards_each: int = 7) -> str | None:
+        """Delar ut och startar en runda. Returnerar felmeddelande eller None."""
         if len(self.players) < 2:
             return "Det behövs minst två spelare."
         decks = 1 if len(self.players) * cards_each <= 26 else 2
         if len(self.players) * cards_each > decks * 52 - 10:
             return "För många kort per spelare för så många spelare."
-        random.shuffle(self.players)
         deck = [Card(s, r, d) for d in range(decks) for s in SUITS for r in RANKS]
         random.shuffle(deck)
         self.hands = {p: [deck.pop() for _ in range(cards_each)] for p in self.players}
         self.pile = [deck.pop()]
         self.draw_pile = deck
+        self.turn, self.direction = 0, 1
         self.started, self.finished, self.winner = True, False, None
-        self.last = None
-        self.seq += 1
         return None
 
     # ---------- hjälpare ----------
+    @property
+    def current(self) -> int:
+        return self.players[self.turn]
+
     @property
     def top(self) -> Card:
         return self.pile[-1]
@@ -115,15 +102,11 @@ class Game:
     def name(self, uid: int) -> str:
         return self.names.get(uid, str(uid))
 
-    def order_text(self, with_counts: bool = True) -> str:
-        parts = [f"{self.name(p)} ({len(self.hands[p])})" if with_counts else self.name(p) for p in self.players]
-        return " → ".join(parts) + " ↺"
-
     def sorted_hand(self, uid: int) -> list[Card]:
         return sorted(self.hands.get(uid, []), key=lambda c: (SUITS.index(c.suit), RANKS.index(c.rank), c.deck))
 
-    def _next_after(self, uid: int) -> int:
-        return self.players[(self.players.index(uid) + 1) % len(self.players)]
+    def _advance(self, steps: int = 1) -> None:
+        self.turn = (self.turn + self.direction * steps) % len(self.players)
 
     def _draw(self, uid: int, n: int = 1) -> list[Card]:
         drawn: list[Card] = []
@@ -139,73 +122,48 @@ class Game:
             drawn.append(card)
         return drawn
 
-    def _active(self, uid: int) -> bool:
-        return self.started and not self.finished and uid in self.players
-
     # ---------- handlingar ----------
     def penalty(self, uid: int, reason: str) -> Outcome:
-        """Manuellt straffkort (utan att något kort tas tillbaka)."""
         self._draw(uid, 1)
         return Outcome(False, private=f"Straffkort: {reason}", event=f"**{self.name(uid)}** får ett straffkort: *{reason}*")
 
     def play(self, uid: int, card_id: str) -> Outcome:
-        if not self._active(uid):
+        if self.finished or not self.started or uid not in self.players:
             return Outcome(False, private="Du är inte med i ett pågående spel.")
+        if uid != self.current:
+            return self.penalty(uid, "Inte din tur")
         card = next((c for c in self.hands[uid] if c.id == card_id), None)
         if card is None:
             return Outcome(False, private="Du har inte det kortet längre.")
+        if not card.matches(self.top):
+            return self.penalty(uid, "Fel kort")
+
         self.hands[uid].remove(card)
         self.pile.append(card)
-        action = LastAction("play", uid, card)
-        effect = self.effects.get(card.rank)
-        if effect in EFFECTS:  # effekter annonseras inte: de ska man lista ut själv
-            action.victim = self._next_after(uid)
-            action.victim_cards = self._draw(action.victim, int(effect[-1]))
-        self.last, self.seq = action, self.seq + 1
-
         event = f"**{self.name(uid)}** la {card.label}."
         if not self.hands[uid]:
             self.finished, self.winner = True, uid
-            event += f"\n🏆 **{self.name(uid)}** har inga kort kvar och vinner!"
+            return Outcome(True, event=f"{event}\n🏆 **{self.name(uid)}** har inga kort kvar och vinner!")
+
+        steps = 1
+        effect = self.effects.get(card.rank)
+        if effect == "reverse":
+            self.direction *= -1
+        elif effect == "skip":
+            steps = 2
+        elif effect == "draw2":
+            self._advance(1)
+            self._draw(self.current, 2)
+        self._advance(steps)  # effekter annonseras inte: de ska man lista ut själv
         return Outcome(True, event=event)
 
     def draw(self, uid: int) -> Outcome:
-        if not self._active(uid):
+        if self.finished or not self.started or uid not in self.players:
             return Outcome(False, private="Du är inte med i ett pågående spel.")
+        if uid != self.current:
+            return self.penalty(uid, "Inte din tur")
         drawn = self._draw(uid, 1)
-        self.last, self.seq = LastAction("draw", uid), self.seq + 1
+        self._advance(1)
         if not drawn:
             return Outcome(True, private="Leken är tom.", event=f"**{self.name(uid)}** försökte dra men leken är slut.")
         return Outcome(True, private=f"Du drog {drawn[0].label}.", event=f"**{self.name(uid)}** drog ett kort.")
-
-    def pass_turn(self, uid: int) -> Outcome:
-        if not self._active(uid):
-            return Outcome(False, private="Du är inte med i ett pågående spel.")
-        self.last, self.seq = LastAction("pass", uid), self.seq + 1
-        return Outcome(True, private="Du passade.", event=f"**{self.name(uid)}** passade.")
-
-    def penalize_last(self, seq: int, by_uid: int, reason: str = "Inte din tur", target: int | None = None) -> Outcome:
-        """Domare: tar tillbaka det senaste draget (om det var ett kort) och ger spelaren ett straffkort."""
-        if by_uid not in self.keepers:
-            return Outcome(False, private="Bara den som dömer (regelhållare) kan dela ut straff.")
-        if not self.started:
-            return Outcome(False, private="Inget pågående spel.")
-        if self.last is None or seq != self.seq:
-            return Outcome(False, private="Det har hänt något sedan dess, så det går inte att ta tillbaka längre.")
-        act = self.last
-        if target is not None and act.uid != target:
-            return Outcome(False, private="Den spelaren gjorde inte det senaste draget.")
-        if act.uid == by_uid:
-            return Outcome(False, private="Du kan inte döma dig själv, be en annan regelhållare.")
-        if act.kind == "play" and act.card is not None:
-            self.pile.pop()  # kortet går tillbaka till spelaren
-            self.hands[act.uid].append(act.card)
-            if act.victim is not None:  # ångra en eventuell effekt
-                for c in act.victim_cards:
-                    self.hands[act.victim].remove(c)
-                self.draw_pile.extend(act.victim_cards)
-            self.finished, self.winner = False, None
-        self.last, self.seq = None, self.seq + 1
-        self._draw(act.uid, 1)
-        extra = " Kortet tas tillbaka." if act.kind == "play" else ""
-        return Outcome(True, event=f"**{self.name(act.uid)}** får ett straffkort: *{reason}*.{extra}")
