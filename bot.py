@@ -338,7 +338,7 @@ class TableView(discord.ui.View):
         if game is None:
             await interaction.response.send_message("Spelet är slut.", ephemeral=True)
             return
-        if game.finished and game.last is not None:
+        if game.finished and game.last is not None and game.last_judgment is None:
             out = game.penalize_last(self.seq, interaction.user.id, "Felbedömning av vinst")
         else:
             out = game.undo_last_judgment(interaction.user.id)
