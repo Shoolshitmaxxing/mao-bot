@@ -60,6 +60,20 @@ class LastAction:
 
 
 @dataclass
+class LastJudgment:
+    """Ögonblicksbild som gör att en dömning kan felbedömas och återställas."""
+    judge_uid: int
+    reason: str
+    hands: dict[int, list[Card]]
+    draw_pile: list[Card]
+    pile: list[Card]
+    finished: bool
+    winner: int | None
+    last: LastAction | None
+    seq: int
+
+
+@dataclass
 class Game:
     channel_id: int
     host_id: int
@@ -75,6 +89,7 @@ class Game:
     effects: dict[str, str] = field(default_factory=dict)  # valör -> effekt
     last: LastAction | None = None
     seq: int = 0  # räknas upp vid varje drag; knappar på gamla bordsmeddelanden blir ogiltiga
+    last_judgment: LastJudgment | None = None
     table_msg: Any = None  # senaste bordsmeddelandet i Discord
     hand_ix: dict[int, tuple[Any, int]] = field(default_factory=dict)  # spelare -> (interaction, sida) för live-uppdatering
 
@@ -104,6 +119,7 @@ class Game:
         self.draw_pile = deck
         self.started, self.finished, self.winner = True, False, None
         self.last = None
+        self.last_judgment = None
         self.seq += 1
         return None
 
@@ -142,10 +158,47 @@ class Game:
     def _active(self, uid: int) -> bool:
         return self.started and not self.finished and uid in self.players
 
+    def _judgment_snapshot(self, judge_uid: int, reason: str) -> LastJudgment:
+        return LastJudgment(
+            judge_uid=judge_uid,
+            reason=reason,
+            hands={uid: list(hand) for uid, hand in self.hands.items()},
+            draw_pile=list(self.draw_pile),
+            pile=list(self.pile),
+            finished=self.finished,
+            winner=self.winner,
+            last=self.last,
+            seq=self.seq,
+        )
+
+    def undo_last_judgment(self, uid: int) -> Outcome:
+        if uid not in self.players:
+            return Outcome(False, private="Bara spelare i spelet kan göra en felbedömning.")
+        judgment = self.last_judgment
+        if judgment is None:
+            return Outcome(False, private="Det finns ingen dömning att felbedöma.")
+        self.hands = {player: list(hand) for player, hand in judgment.hands.items()}
+        self.draw_pile = list(judgment.draw_pile)
+        self.pile = list(judgment.pile)
+        self.finished = judgment.finished
+        self.winner = judgment.winner
+        self.last = judgment.last
+        self.seq = judgment.seq + 1
+        judge_name = self.name(judgment.judge_uid)
+        reason = judgment.reason
+        self.last_judgment = None
+        return Outcome(
+            True,
+            event=f"Felbedömning: **{judge_name}**s dömning (*{reason}*) har ångrats.",
+        )
+
     # ---------- handlingar ----------
-    def penalty(self, uid: int, reason: str) -> Outcome:
+    def penalty(self, uid: int, reason: str, judge_uid: int | None = None) -> Outcome:
         """Manuellt straffkort (utan att något kort tas tillbaka)."""
+        snapshot = self._judgment_snapshot(judge_uid if judge_uid is not None else uid, reason)
         self._draw(uid, 1)
+        self.seq += 1
+        self.last_judgment = snapshot
         return Outcome(False, private=f"Straffkort: {reason}", event=f"**{self.name(uid)}** får ett straffkort: *{reason}*")
 
     def play(self, uid: int, card_id: str) -> Outcome:
@@ -162,6 +215,7 @@ class Game:
             action.victim = self._next_after(uid)
             action.victim_cards = self._draw(action.victim, int(effect[-1]))
         self.last, self.seq = action, self.seq + 1
+        self.last_judgment = None
 
         event = f"**{self.name(uid)}** la {card.label}."
         if not self.hands[uid]:
@@ -174,6 +228,7 @@ class Game:
             return Outcome(False, private="Du är inte med i ett pågående spel.")
         drawn = self._draw(uid, 1)
         self.last, self.seq = LastAction("draw", uid), self.seq + 1
+        self.last_judgment = None
         if not drawn:
             return Outcome(True, private="Leken är tom.", event=f"**{self.name(uid)}** försökte dra men leken är slut.")
         return Outcome(True, private=f"Du drog {drawn[0].label}.", event=f"**{self.name(uid)}** drog ett kort.")
@@ -182,21 +237,23 @@ class Game:
         if not self._active(uid):
             return Outcome(False, private="Du är inte med i ett pågående spel.")
         self.last, self.seq = LastAction("pass", uid), self.seq + 1
+        self.last_judgment = None
         return Outcome(True, private="Du passade.", event=f"**{self.name(uid)}** passade.")
 
     def penalize_last(self, seq: int, by_uid: int, reason: str = "Inte din tur", target: int | None = None) -> Outcome:
-        """Domare: tar tillbaka det senaste draget (om det var ett kort) och ger spelaren ett straffkort."""
-        if by_uid not in self.keepers:
-            return Outcome(False, private="Bara den som dömer (regelhållare) kan dela ut straff.")
+        """Tar tillbaka det senaste draget (om det var ett kort) och ger spelaren ett straffkort."""
         if not self.started:
             return Outcome(False, private="Inget pågående spel.")
+        if by_uid not in self.players:
+            return Outcome(False, private="Bara spelare i spelet kan döma.")
         if self.last is None or seq != self.seq:
             return Outcome(False, private="Det har hänt något sedan dess, så det går inte att ta tillbaka längre.")
         act = self.last
         if target is not None and act.uid != target:
             return Outcome(False, private="Den spelaren gjorde inte det senaste draget.")
         if act.uid == by_uid:
-            return Outcome(False, private="Du kan inte döma dig själv, be en annan regelhållare.")
+            return Outcome(False, private="Du kan inte döma dig själv.")
+        snapshot = self._judgment_snapshot(by_uid, reason)
         if act.kind == "play" and act.card is not None:
             self.pile.pop()  # kortet går tillbaka till spelaren
             self.hands[act.uid].append(act.card)
@@ -207,5 +264,6 @@ class Game:
             self.finished, self.winner = False, None
         self.last, self.seq = None, self.seq + 1
         self._draw(act.uid, 1)
+        self.last_judgment = snapshot
         extra = " Kortet tas tillbaka." if act.kind == "play" else ""
         return Outcome(True, event=f"**{self.name(act.uid)}** får ett straffkort: *{reason}*.{extra}")
