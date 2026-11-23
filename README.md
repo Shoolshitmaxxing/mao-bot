@@ -4,20 +4,18 @@ Discord-bot för att spela Mao på distans, i text. Boten sköter korten, högen
 Så spelar man
 /mao ny → alla skriver /mao delta → regelhållaren skriver /mao starta (5 kort var).
 Boten slumpar cirkelns ordning. Startmeddelandet visar bara cirkelordningen, därefter visar den översta kortet och ordningen med antal kort kvar.
-Tryck Visa min hand under bordsmeddelandet. Där väljer du kort i dropdown-menyn, eller trycker Dra kort / Passa. Handen uppdateras live när något händer (t.ex. straffkort).
+Högen börjar tom. En spelare lägger det första kortet från sin hand.
+När draghögen tar slut blandas 52 nya kort med korten under översta kortet. Översta kortet ligger kvar.
+Använd /mao hand för att öppna din privata hand. Där väljer du kort i dropdown-menyn, eller trycker Dra kort / Passa. Den privata handen uppdateras automatiskt när kort spelas eller straff delas ut.
 Boten dömer aldrig själv. Du kan lägga vilket kort som helst när som helst. Alla spelare kan bedöma om ett drag är fel.
-Under bordsmeddelandet har alla spelare knapparna ⚠️ Inte din tur och ⚠️ Fel kort. De tar tillbaka det senaste draget (kortet går tillbaka till spelaren, eventuell hemlig effekt ångras) och ger spelaren ett straffkort, så nästa spelare spelar på samma kort som förut. Knappen gäller bara det allra senaste draget, och en spelare kan inte döma sig själv (be en annan spelare).
-En Felbedömning-knapp under bordsmeddelandet ångrar den senaste dömningen, inklusive kort och straffkort.
-Övriga straff ("Pratade", "Glömde något" osv.) delas ut med /straff. Lägg till ta_tillbaka:True om spelarens senaste kort också ska tas tillbaka.
+Under bordsmeddelandet har alla spelare knapparna ⚠️ Inte din tur, 🗣️ Pratade och ⚠️ Straff. Pratade låter dig välja spelare och ger ett straffkort utan att ta tillbaka kort. Straff låter dig välja spelare, skriva en egen anledning och välja om spelarens senast lagda kort ska tas tillbaka. Kortet kan bara tas tillbaka från den som lade det senast. Inte din tur gäller automatiskt senaste spelaren och tar tillbaka kortet. Du kan också döma eller straffa dig själv.
+En Felbedömning-knapp under bordsmeddelandet ångrar den senaste dömningen, inklusive kort och straffkort. Kortet flyttas till den som dömde fel i stället för att dra ett nytt. Även en felbedömning kan felbedömas, då går kortet tillbaka till den andra spelaren. Knappen visas efter en vinst och tar tillbaka vinnarens sista kort.
 Kommandon
 Kommando	Vem	Vad
 /mao ny	alla	Skapar ett spel i kanalen, du blir regelhållare
 /mao delta	spelare	Gå med
 /mao starta [kort]	regelhållare	Delar ut (standard 5 kort) och slumpar ordningen
-/mao hand	spelare	Visar din hand privat (eller tryck Visa min hand)
-/straff spelare [anledning] [egen_text] [ta_tillbaka]	regelhållare	Straffkort med vag anledning
-/mao effekt valor effekt	regelhållare	Hemlig effekt: nästa i cirkeln drar 1 eller 2 kort. Syns bara för dig
-/mao regelhallare spelare	regelhållare	Lägg till/ta bort regelhållare
+/mao hand	spelare	Visa din hand privat; handen uppdateras automatiskt efter spel och straff
 /mao slut	regelhållare	Avsluta spelet
 1. Skapa boten
 Gå till https://discord.com/developers/applications och skapa en ny application.
@@ -59,6 +57,6 @@ Starta som Worker. Railway-konfigurationsfilerna installerar DejaVu-fonten och k
 Om bilderna saknas, kontrollera deploymentloggen efter fel med PIL, Pillow, PNG eller felmeddelandet Ogiltig PNG-data.
 Känt i prototypen
 Spelet ligger i minnet: startar du om boten försvinner pågående spel.
-Handvyn är ett privat (ephemeral) meddelande. Discord kan inte fästa sådana längst ner, och live-uppdateringen fungerar i ca 15 minuter efter ditt senaste klick. Därefter: Visa min hand igen.
+Handvyn är ett privat (ephemeral) meddelande. Discord kan inte fästa sådana längst ner, och live-uppdateringen fungerar i ca 15 minuter efter ditt senaste klick. Därefter: använd /mao hand igen.
 Dropdown-menyn rymmer 25 kort per sida; fler visas med ◀ ▶.
 Ett spel per kanal.
