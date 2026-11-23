@@ -68,10 +68,9 @@ class LastJudgment:
     winner: int | None
     last: LastAction | None
     seq: int
-    target_uid: int | None = None
     award_card: Card | None = None
-    card_holder_uid: int | None = None
-    is_undo: bool = False
+    refill_draw_pile: list[Card] | None = None
+    refill_pile: list[Card] | None = None
 
 
 @dataclass
@@ -187,17 +186,6 @@ class Game:
         if judgment is None:
             return Outcome(False, private="Det finns ingen dömning att felbedöma.")
         undo_snapshot = self._judgment_snapshot(uid, f"Felbedömning av {judgment.reason}")
-        undo_snapshot.target_uid = judgment.target_uid
-        undo_snapshot.award_card = judgment.award_card
-        undo_snapshot.card_holder_uid = next(
-            (
-                player
-                for player, hand in self.hands.items()
-                if judgment.award_card is not None and judgment.award_card in hand
-            ),
-            None,
-        )
-        undo_snapshot.is_undo = True
         self.hands = {player: list(hand) for player, hand in judgment.hands.items()}
         self.draw_pile = list(judgment.draw_pile)
         self.pile = list(judgment.pile)
@@ -205,21 +193,36 @@ class Game:
         self.winner = judgment.winner
         self.last = judgment.last
         self.seq = judgment.seq + 1
+        if judgment.refill_draw_pile is not None:
+            self.draw_pile = list(judgment.refill_draw_pile)
+            original_top = judgment.pile[-1] if judgment.pile else None
+            refill_top = judgment.refill_pile[-1] if judgment.refill_pile else None
+            if refill_top is not None and refill_top != original_top:
+                self.draw_pile.append(refill_top)
+                random.shuffle(self.draw_pile)
+            self.pile = [original_top] if original_top is not None else []
         judge_name = self.name(judgment.judge_uid)
         reason = judgment.reason
-        if judgment.is_undo:
-            holder = self.name(judgment.card_holder_uid) if judgment.card_holder_uid is not None else "den andra spelaren"
-            penalty = f" Kortet går tillbaka till **{holder}**; inget nytt kort dras."
-        elif judgment.award_card is not None:
-            if judgment.award_card in self.draw_pile:
-                self.draw_pile.remove(judgment.award_card)
-            elif judgment.award_card in self.pile:
-                self.pile.remove(judgment.award_card)
-            self.hands[judgment.judge_uid].append(judgment.award_card)
-            penalty = f" Kortet flyttas till **{judge_name}**; inget nytt kort dras."
-        else:
-            penalty = " Inget straffkort fanns att flytta."
+        transferred = judgment.award_card is not None
+        if judgment.award_card is not None:
+            card = judgment.award_card
+            for hand in self.hands.values():
+                if card in hand:
+                    hand.remove(card)
+                    break
+            else:
+                if card in self.draw_pile:
+                    self.draw_pile.remove(card)
+                elif card in self.pile:
+                    self.pile.remove(card)
+            self.hands[judgment.judge_uid].append(card)
+            undo_snapshot.award_card = card
         self.last_judgment = undo_snapshot
+        penalty = (
+            f" Kortet {judgment.award_card.label} flyttas till **{judge_name}**."
+            if transferred
+            else " Det fanns inget straffkort att flytta."
+        )
         return Outcome(
             True,
             event=f"Felbedömning: **{judge_name}**s dömning (*{reason}*) har ångrats.{penalty}",
@@ -230,12 +233,14 @@ class Game:
         if not self.started or uid not in self.players or judge_uid not in self.players:
             return Outcome(False, private="Både den som dömer och spelaren som straffas måste vara med.")
         snapshot = self._judgment_snapshot(judge_uid, reason)
+        refilled = not self.draw_pile
         drawn = self._draw(uid, 1)
         if not drawn:
             return Outcome(False, private="Leken är tom, så inget straffkort kunde dras.")
-        snapshot.target_uid = uid
         snapshot.award_card = drawn[0]
-        snapshot.card_holder_uid = uid
+        if refilled:
+            snapshot.refill_draw_pile = list(self.draw_pile)
+            snapshot.refill_pile = list(self.pile)
         if uid == self.winner:
             self.finished, self.winner = False, None
         self.last, self.seq = None, self.seq + 1
@@ -303,7 +308,6 @@ class Game:
         if target is not None and act.uid != target:
             return Outcome(False, private="Den spelaren gjorde inte det senaste draget.")
         snapshot = self._judgment_snapshot(by_uid, reason)
-        snapshot.target_uid = act.uid
         if take_back and act.kind == "play" and act.card is not None:
             self.pile.pop()  # kortet går tillbaka till spelaren
             self.hands[act.uid].append(act.card)
@@ -314,10 +318,13 @@ class Game:
         if act.uid == self.winner:
             self.finished, self.winner = False, None
         self.last, self.seq = None, self.seq + 1
+        refilled = not self.draw_pile
         drawn = self._draw(act.uid, 1)
         if drawn:
             snapshot.award_card = drawn[0]
-            snapshot.card_holder_uid = act.uid
+            if refilled:
+                snapshot.refill_draw_pile = list(self.draw_pile)
+                snapshot.refill_pile = list(self.pile)
         self.last_judgment = snapshot
         extra = " Kortet tas tillbaka." if take_back and act.kind == "play" else ""
         return Outcome(True, event=f"**{self.name(act.uid)}** får ett straffkort: *{reason}*.{extra}")
