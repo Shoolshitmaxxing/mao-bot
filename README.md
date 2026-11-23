@@ -1,34 +1,24 @@
 # Mao-bot (prototyp)
 
-Discord-bot för att spela Mao på distans, i text. Boten sköter korten, högen och straffkorten,
-men **ni avgör själva vems tur det är**. Boten visar bara hur ni "sitter i cirkeln".
-
-## Så spelar man
-- `/mao ny` → alla skriver `/mao delta` → regelhållaren skriver `/mao starta` (5 kort var).
-- Boten slumpar cirkelns ordning och säger vem som börjar. Därefter visar den bara översta kortet
-  och ordningen med antal kort kvar.
-- Tryck **Visa min hand** under bordsmeddelandet. Där väljer du kort i dropdown-menyn, eller
-  trycker **Dra kort** / **Passa**. Handen uppdateras live när något händer (t.ex. straffkort).
-- **Boten dömer aldrig själv.** Du kan lägga vilket kort som helst när som helst. Regelhållarna är
-  domarna och bestämmer vad som är fel.
-- Under bordsmeddelandet har domarna knapparna **⚠️ Inte din tur** och **⚠️ Fel kort**. De tar tillbaka
-  det senaste draget (kortet går tillbaka till spelaren, eventuell hemlig effekt ångras) och ger spelaren
-  ett straffkort, så nästa spelare spelar på samma kort som förut. Knappen gäller bara det allra senaste
-  draget, och en domare kan inte döma sig själv (be en annan regelhållare).
-- Övriga straff ("Pratade", "Glömde något" osv.) delas ut med `/straff`. Lägg till `ta_tillbaka:True`
-  om spelarens senaste kort också ska tas tillbaka.
+Discord-bot för att spela Mao på distans, i text. Boten sköter kort, turordning och
+de mekaniska straffen ("Inte din tur", "Fel kort"). Regelhållaren delar ut övriga
+straffkort manuellt med `/straff`.
 
 ## Kommandon
 | Kommando | Vem | Vad |
 |---|---|---|
 | `/mao ny` | alla | Skapar ett spel i kanalen, du blir regelhållare |
 | `/mao delta` | spelare | Gå med |
-| `/mao starta [kort]` | regelhållare | Delar ut (standard 5 kort) och slumpar ordningen |
-| `/mao hand` | spelare | Visar din hand privat (eller tryck **Visa min hand**) |
-| `/straff spelare [anledning] [egen_text] [ta_tillbaka]` | regelhållare | Straffkort med vag anledning |
-| `/mao effekt valor effekt` | regelhållare | Hemlig effekt: nästa i cirkeln drar 1 eller 2 kort. Syns bara för dig |
+| `/mao starta [kort]` | regelhållare | Delar ut (standard 7 kort) |
+| `/mao hand` | spelare | Visar din hand privat (eller tryck **Visa min hand** på bordet) |
+| `/straff spelare anledning [egen_text]` | regelhållare | Straffkort med vag anledning |
+| `/mao effekt valor effekt` | regelhållare | Hemlig effekt (hoppa över / byt riktning / dra 2). Syns bara för dig |
 | `/mao regelhallare spelare` | regelhållare | Lägg till/ta bort regelhållare |
 | `/mao slut` | regelhållare | Avsluta spelet |
+
+Man lägger kort via dropdown-menyn i den privata handvyn. **Dra kort** drar ett kort och
+avslutar din tur. Matchar kortet varken färg eller valör, eller lägger man ur tur, får
+man automatiskt straffkort. Allt annat ("Pratade", "Glömde något" osv.) dömer regelhållaren.
 
 ## 1. Skapa boten
 1. Gå till https://discord.com/developers/applications och skapa en ny application.
@@ -75,7 +65,5 @@ journalctl -u mao-bot -f                 # loggar
 
 ## Känt i prototypen
 - Spelet ligger i minnet: startar du om boten försvinner pågående spel.
-- Handvyn är ett privat (ephemeral) meddelande. Discord kan inte fästa sådana längst ner, och
-  live-uppdateringen fungerar i ca 15 minuter efter ditt senaste klick. Därefter: **Visa min hand** igen.
-- Dropdown-menyn rymmer 25 kort per sida; fler visas med ◀ ▶.
+- Max en handsida är 25 kort i dropdown; fler visas med ◀ ▶.
 - Ett spel per kanal.
