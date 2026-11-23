@@ -138,15 +138,23 @@ class Game:
     def _next_after(self, uid: int) -> int:
         return self.players[(self.players.index(uid) + 1) % len(self.players)]
 
+    def _refill_draw_pile(self) -> None:
+        top = self.pile[-1] if self.pile else None
+        rest = self.pile[:-1] if top is not None else []
+        existing_cards = [card for hand in self.hands.values() for card in hand]
+        existing_cards.extend(self.draw_pile)
+        existing_cards.extend(self.pile)
+        deck_id = max((card.deck for card in existing_cards), default=-1) + 1
+        rest.extend(Card(suit, rank, deck_id) for suit in SUITS for rank in RANKS)
+        random.shuffle(rest)
+        self.draw_pile = rest
+        self.pile = [top] if top is not None else []
+
     def _draw(self, uid: int, n: int = 1) -> list[Card]:
         drawn: list[Card] = []
         for _ in range(n):
-            if not self.draw_pile and len(self.pile) > 1:
-                rest, self.pile = self.pile[:-1], [self.pile[-1]]
-                random.shuffle(rest)
-                self.draw_pile = rest
             if not self.draw_pile:
-                break
+                self._refill_draw_pile()
             card = self.draw_pile.pop()
             self.hands[uid].append(card)
             drawn.append(card)
@@ -174,6 +182,7 @@ class Game:
         judgment = self.last_judgment
         if judgment is None:
             return Outcome(False, private="Det finns ingen dömning att felbedöma.")
+        undo_snapshot = self._judgment_snapshot(uid, f"Felbedömning av {judgment.reason}")
         self.hands = {player: list(hand) for player, hand in judgment.hands.items()}
         self.draw_pile = list(judgment.draw_pile)
         self.pile = list(judgment.pile)
@@ -184,7 +193,7 @@ class Game:
         judge_name = self.name(judgment.judge_uid)
         reason = judgment.reason
         drawn = self._draw(judgment.judge_uid, 1)
-        self.last_judgment = None
+        self.last_judgment = undo_snapshot
         penalty = " får ett straffkort för felbedömningen." if drawn else ", men leken är tom och inget straffkort kunde dras."
         return Outcome(
             True,
@@ -264,8 +273,6 @@ class Game:
         act = self.last
         if target is not None and act.uid != target:
             return Outcome(False, private="Den spelaren gjorde inte det senaste draget.")
-        if act.uid == by_uid:
-            return Outcome(False, private="Du kan inte döma dig själv.")
         snapshot = self._judgment_snapshot(by_uid, reason)
         if take_back and act.kind == "play" and act.card is not None:
             self.pile.pop()  # kortet går tillbaka till spelaren
