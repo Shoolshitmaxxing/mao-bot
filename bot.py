@@ -11,7 +11,7 @@ from discord import app_commands
 from dotenv import load_dotenv
 
 import cards
-from game import EFFECTS, RANKS, Game, Outcome
+from game import Game, Outcome
 
 load_dotenv()
 TOKEN = os.environ["DISCORD_TOKEN"]
@@ -155,7 +155,7 @@ class PenaltyModal(discord.ui.Modal, title="Dela ut straffkort"):
         if not reason:
             await interaction.response.send_message("Skriv en anledning.", ephemeral=True)
             return
-        out = game.penalize_last(self.seq, interaction.user.id, reason)
+        out = game.penalize_last(self.seq, interaction.user.id, reason, take_back=False)
         if not out.ok:
             await interaction.response.send_message(out.private, ephemeral=True)
             return
@@ -177,7 +177,7 @@ class TableView(discord.ui.View):
     def __init__(self, channel_id: int, seq: int, can_penalize: bool, can_undo_judgment: bool):
         super().__init__(timeout=None)
         self.channel_id, self.seq = channel_id, seq
-        self.not_your_turn.disabled = self.straff.disabled = not can_penalize
+        self.not_your_turn.disabled = self.pratade.disabled = self.straff.disabled = not can_penalize
         self.wrong_judgment.disabled = not can_undo_judgment
 
     @discord.ui.button(label="Visa min hand", emoji="🃏", style=discord.ButtonStyle.primary)
@@ -188,12 +188,12 @@ class TableView(discord.ui.View):
             return
         await send_hand(interaction, game)
 
-    async def _judge(self, interaction: discord.Interaction, reason: str) -> None:
+    async def _judge(self, interaction: discord.Interaction, reason: str, take_back: bool = True) -> None:
         game = games.get(self.channel_id)
         if game is None:
             await interaction.response.send_message("Spelet är slut.", ephemeral=True)
             return
-        out = game.penalize_last(self.seq, interaction.user.id, reason)
+        out = game.penalize_last(self.seq, interaction.user.id, reason, take_back=take_back)
         if not out.ok:
             await interaction.response.send_message(out.private, ephemeral=True)
             return
@@ -203,6 +203,10 @@ class TableView(discord.ui.View):
     @discord.ui.button(label="Inte din tur", emoji="⚠️", style=discord.ButtonStyle.danger)
     async def not_your_turn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._judge(interaction, "Inte din tur")
+
+    @discord.ui.button(label="Pratade", emoji="🗣️", style=discord.ButtonStyle.danger)
+    async def pratade(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._judge(interaction, "Pratade", take_back=False)
 
     @discord.ui.button(label="Straff", emoji="⚠️", style=discord.ButtonStyle.danger)
     async def straff(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -395,54 +399,6 @@ async def starta(interaction: discord.Interaction, kort: app_commands.Range[int,
     )
     await post_table(game, interaction.channel)
     await refresh_all_hands(game)
-
-
-@mao.command(name="hand", description="Visa din hand (bara du ser den)")
-async def hand(interaction: discord.Interaction):
-    game = find_game(interaction)
-    if game is None or interaction.user.id not in game.players or not game.started:
-        await interaction.response.send_message("Du är inte med i ett pågående spel här.", ephemeral=True)
-        return
-    await send_hand(interaction, game)
-
-
-@mao.command(name="regelhallare", description="Gör någon till regelhållare (eller ta bort rollen)")
-@app_commands.describe(spelare="Vem som ska få eller förlora rollen")
-async def regelhallare(interaction: discord.Interaction, spelare: discord.Member):
-    game = find_game(interaction)
-    if game is None or interaction.user.id not in game.keepers:
-        await interaction.response.send_message("Bara regelhållare kan göra det här.", ephemeral=True)
-        return
-    if spelare.id in game.keepers:
-        if len(game.keepers) == 1:
-            await interaction.response.send_message("Det måste finnas minst en regelhållare.", ephemeral=True)
-            return
-        game.keepers.discard(spelare.id)
-        await interaction.response.send_message(f"{spelare.display_name} är inte längre regelhållare.")
-    else:
-        game.keepers.add(spelare.id)
-        game.names.setdefault(spelare.id, spelare.display_name)
-        await interaction.response.send_message(f"{spelare.display_name} är nu regelhållare.")
-
-
-@mao.command(name="effekt", description="Hemlig effekt för en valör (syns bara för dig)")
-@app_commands.describe(valor="Vilken valör som ska ha effekten", effekt="Vad som händer när kortet läggs")
-@app_commands.choices(
-    valor=[app_commands.Choice(name=r, value=r) for r in RANKS],
-    effekt=[app_commands.Choice(name=f"{k}: {v}", value=k) for k, v in EFFECTS.items()]
-    + [app_commands.Choice(name="ingen (ta bort)", value="none")],
-)
-async def effekt(interaction: discord.Interaction, valor: app_commands.Choice[str], effekt: app_commands.Choice[str]):
-    game = find_game(interaction)
-    if game is None or interaction.user.id not in game.keepers:
-        await interaction.response.send_message("Bara regelhållare kan sätta effekter.", ephemeral=True)
-        return
-    if effekt.value == "none":
-        game.effects.pop(valor.value, None)
-    else:
-        game.effects[valor.value] = effekt.value
-    overview = "\n".join(f"{r}: {EFFECTS[e]}" for r, e in game.effects.items()) or "inga effekter"
-    await interaction.response.send_message(f"Sparat (bara du ser det). Aktiva effekter:\n{overview}", ephemeral=True)
 
 
 @mao.command(name="slut", description="Avsluta spelet (regelhållare)")
