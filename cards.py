@@ -2,9 +2,7 @@
 from __future__ import annotations
 
 import io
-import logging
 from functools import lru_cache
-from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -14,9 +12,7 @@ W, H = 150, 210
 STEP = 55  # hur mycket korten överlappar i handen
 PER_ROW = 16  # max kort per rad i handbilden
 
-# Typsnittet följer med i projektet (fonts/), så det funkar även på Railway/Docker utan systemtypsnitt.
 FONT_PATHS = [
-    str(Path(__file__).resolve().parent / "fonts" / "DejaVuSans-Bold.ttf"),
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",  # Raspberry Pi OS / Debian (fonts-dejavu-core)
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
@@ -35,11 +31,7 @@ def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
             return ImageFont.truetype(path, size)
         except OSError:
             continue
-    logging.warning("Hittade inget typsnitt med färgsymboler (♠♥♦♣), korten kommer se fel ut. Kontrollera fonts/-mappen.")
-    try:
-        return ImageFont.load_default(size)
-    except TypeError:  # gammal Pillow
-        return ImageFont.load_default()
+    return ImageFont.load_default()
 
 
 @lru_cache(maxsize=None)
