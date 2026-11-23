@@ -45,8 +45,16 @@ async def post_table(game: Game, channel: discord.abc.Messageable, event: str = 
         except discord.HTTPException:
             pass
     if game.finished:
-        game.table_msg = None
-        await channel.send(event + "\nStarta en ny runda med `/mao starta`.")
+        view = TableView(
+            game.channel_id,
+            game.seq,
+            game.last is not None,
+            game.last_judgment is not None or game.last is not None,
+        )
+        game.table_msg = await channel.send(
+            event + "\nStarta en ny runda med `/mao starta`. Om vinsten var fel, tryck **Felbedömning**.",
+            view=view,
+        )
         return
     view = TableView(
         game.channel_id,
@@ -179,7 +187,10 @@ class TableView(discord.ui.View):
         if game is None:
             await interaction.response.send_message("Spelet är slut.", ephemeral=True)
             return
-        out = game.undo_last_judgment(interaction.user.id)
+        if game.finished and game.last is not None:
+            out = game.penalize_last(self.seq, interaction.user.id, "Felbedömning av vinst")
+        else:
+            out = game.undo_last_judgment(interaction.user.id)
         if not out.ok:
             await interaction.response.send_message(out.private, ephemeral=True)
             return
