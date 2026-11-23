@@ -14,9 +14,6 @@ SUITS = "SHDC"  # spader, hjärter, ruter, klöver
 SYMBOLS = {"S": "♠", "H": "♥", "D": "♦", "C": "♣"}
 RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
 
-# Medvetet breda anledningar, så att man inte förstår exakt vilken regel som bröts.
-REASONS = ["Inte din tur", "Pratade", "Fel kort", "Glömde något", "Sa fel sak", "För långsam", "Gjorde fel"]
-
 # Hemliga effekter som regelhållaren kan koppla till en valör.
 EFFECTS = {
     "draw1": "nästa spelare i cirkeln drar 1 kort",
@@ -195,25 +192,6 @@ class Game:
         )
 
     # ---------- handlingar ----------
-    def penalty(self, uid: int, reason: str, judge_uid: int | None = None) -> Outcome:
-        """Manuellt straffkort (utan att något kort tas tillbaka)."""
-        if not self.started or uid not in self.players:
-            return Outcome(False, private="Spelaren är inte med i ett pågående spel.")
-        snapshot = self._judgment_snapshot(judge_uid if judge_uid is not None else uid, reason)
-        drawn = self._draw(uid, 1)
-        if not drawn:
-            return Outcome(False, private="Leken är tom, så inget straffkort kunde dras.")
-        if uid == self.winner:
-            self.finished, self.winner = False, None
-        self.last = None
-        self.seq += 1
-        self.last_judgment = snapshot
-        return Outcome(
-            True,
-            private=f"Du fick ett straffkort: {reason}",
-            event=f"**{self.name(uid)}** får ett straffkort: *{reason}*",
-        )
-
     def play(self, uid: int, card_id: str) -> Outcome:
         if not self._active(uid):
             return Outcome(False, private="Du är inte med i ett pågående spel.")
