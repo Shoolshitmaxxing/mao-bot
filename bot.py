@@ -5,14 +5,13 @@ import io
 import logging
 import math
 import os
-from typing import Optional
 
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
 
 import cards
-from game import EFFECTS, RANKS, REASONS, Game, Outcome
+from game import EFFECTS, RANKS, Game, Outcome
 
 load_dotenv()
 TOKEN = os.environ["DISCORD_TOKEN"]
@@ -136,6 +135,34 @@ def find_game(interaction: discord.Interaction) -> Game | None:
 
 
 # ---------------------------------------------------------------- vyer
+class PenaltyModal(discord.ui.Modal, title="Dela ut straffkort"):
+    def __init__(self, channel_id: int, seq: int):
+        super().__init__(timeout=300)
+        self.channel_id, self.seq = channel_id, seq
+        self.reason = discord.ui.TextInput(
+            label="Anledning",
+            placeholder="Varför får spelaren ett straffkort?",
+            max_length=80,
+        )
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        game = games.get(self.channel_id)
+        if game is None:
+            await interaction.response.send_message("Spelet är slut.", ephemeral=True)
+            return
+        reason = self.reason.value.strip()
+        if not reason:
+            await interaction.response.send_message("Skriv en anledning.", ephemeral=True)
+            return
+        out = game.penalize_last(self.seq, interaction.user.id, reason)
+        if not out.ok:
+            await interaction.response.send_message(out.private, ephemeral=True)
+            return
+        await interaction.response.defer()
+        await after_event(game, interaction.channel, out.event)
+
+
 class TableView(discord.ui.View):
     async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
         logging.exception("Fel i bordsvyn", exc_info=error)
@@ -150,7 +177,7 @@ class TableView(discord.ui.View):
     def __init__(self, channel_id: int, seq: int, can_penalize: bool, can_undo_judgment: bool):
         super().__init__(timeout=None)
         self.channel_id, self.seq = channel_id, seq
-        self.not_your_turn.disabled = self.wrong_card.disabled = not can_penalize
+        self.not_your_turn.disabled = self.straff.disabled = not can_penalize
         self.wrong_judgment.disabled = not can_undo_judgment
 
     @discord.ui.button(label="Visa min hand", emoji="🃏", style=discord.ButtonStyle.primary)
@@ -177,9 +204,19 @@ class TableView(discord.ui.View):
     async def not_your_turn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._judge(interaction, "Inte din tur")
 
-    @discord.ui.button(label="Fel kort", emoji="⚠️", style=discord.ButtonStyle.danger)
-    async def wrong_card(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._judge(interaction, "Fel kort")
+    @discord.ui.button(label="Straff", emoji="⚠️", style=discord.ButtonStyle.danger)
+    async def straff(self, interaction: discord.Interaction, button: discord.ui.Button):
+        game = games.get(self.channel_id)
+        if game is None:
+            await interaction.response.send_message("Spelet är slut.", ephemeral=True)
+            return
+        if interaction.user.id not in game.players:
+            await interaction.response.send_message("Du är inte med i det här spelet.", ephemeral=True)
+            return
+        if game.last is None or game.seq != self.seq:
+            await interaction.response.send_message("Det senaste draget har redan ändrats.", ephemeral=True)
+            return
+        await interaction.response.send_modal(PenaltyModal(self.channel_id, self.seq))
 
     @discord.ui.button(label="Felbedömning", emoji="↩️", style=discord.ButtonStyle.secondary)
     async def wrong_judgment(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -421,45 +458,6 @@ async def slut(interaction: discord.Interaction):
             pass
     del games[interaction.channel_id]
     await interaction.response.send_message("Spelet är avslutat. Starta ett nytt med `/mao ny`.")
-
-
-@bot.tree.command(name="straff", description="Dela ut ett straffkort")
-@app_commands.guild_only()
-@app_commands.describe(spelare="Vem som får straffkortet", anledning="Kort och vag anledning", egen_text="Egen anledning (ersätter listan)", ta_tillbaka="Ta tillbaka spelarens senaste kort (om det var senaste draget)")
-@app_commands.choices(anledning=[app_commands.Choice(name=r, value=r) for r in REASONS])
-async def straff(
-    interaction: discord.Interaction,
-    spelare: discord.Member,
-    anledning: Optional[app_commands.Choice[str]] = None,
-    egen_text: Optional[str] = None,
-    ta_tillbaka: bool = False,
-):
-    game = find_game(interaction)
-    if game is None or not game.started:
-        await interaction.response.send_message("Inget startat spel här.", ephemeral=True)
-        return
-    if interaction.user.id not in game.players:
-        await interaction.response.send_message("Bara spelare i spelet kan dela ut straffkort.", ephemeral=True)
-        return
-    if spelare.id not in game.players:
-        await interaction.response.send_message("Den spelaren är inte med i spelet.", ephemeral=True)
-        return
-    reason = (egen_text or (anledning.value if anledning else "")).strip()
-    if not reason:
-        await interaction.response.send_message("Välj en anledning eller skriv en egen.", ephemeral=True)
-        return
-    if ta_tillbaka:
-        out = game.penalize_last(game.seq, interaction.user.id, reason[:80], target=spelare.id)
-        if not out.ok:
-            await interaction.response.send_message(out.private, ephemeral=True)
-            return
-    else:
-        out = game.penalty(spelare.id, reason[:80], judge_uid=interaction.user.id)
-        if not out.ok:
-            await interaction.response.send_message(out.private, ephemeral=True)
-            return
-    await interaction.response.send_message("Straffkort utdelat.", ephemeral=True)
-    await after_event(game, interaction.channel, out.event)
 
 
 bot.tree.add_command(mao)
