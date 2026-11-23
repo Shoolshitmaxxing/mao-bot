@@ -435,8 +435,8 @@ async def straff(
     ta_tillbaka: bool = False,
 ):
     game = find_game(interaction)
-    if game is None or not game.started or game.finished:
-        await interaction.response.send_message("Inget pågående spel här.", ephemeral=True)
+    if game is None or not game.started:
+        await interaction.response.send_message("Inget startat spel här.", ephemeral=True)
         return
     if interaction.user.id not in game.players:
         await interaction.response.send_message("Bara spelare i spelet kan dela ut straffkort.", ephemeral=True)
@@ -455,6 +455,9 @@ async def straff(
             return
     else:
         out = game.penalty(spelare.id, reason[:80], judge_uid=interaction.user.id)
+        if not out.ok:
+            await interaction.response.send_message(out.private, ephemeral=True)
+            return
     await interaction.response.send_message("Straffkort utdelat.", ephemeral=True)
     await after_event(game, interaction.channel, out.event)
 
