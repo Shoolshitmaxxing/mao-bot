@@ -29,8 +29,8 @@ def png_file(data: bytes, name: str) -> discord.File:
 
 def table_text(game: Game, event: str = "") -> str:
     lines = [event] if event else []
-    lines.append(f"**Översta kortet:** {game.top.label}   |   **Tur:** <@{game.current}>")
-    lines.append("Kort kvar: " + ", ".join(f"{game.name(p)} {len(game.hands[p])}" for p in game.players))
+    lines.append(f"**Översta kortet:** {game.top.label}")
+    lines.append(f"**Ordning:** {game.order_text()}")
     return "\n".join(lines)
 
 
@@ -48,41 +48,64 @@ async def post_table(game: Game, channel: discord.abc.Messageable, event: str = 
     game.table_msg = await channel.send(
         content=table_text(game, event),
         file=png_file(cards.render_top(game.top), "pile.png"),
-        view=TableView(game.channel_id),
+        view=TableView(game.channel_id, game.seq, game.last is not None),
     )
 
 
 def hand_parts(game: Game, uid: int, page: int = 0, note: str = ""):
-    """Returnerar (text, png-bytes eller None, view eller None) för spelarens privata handvy."""
+    """Returnerar (text, png eller None, view eller None, sida) för spelarens privata handvy."""
     hand = game.sorted_hand(uid)
     if not hand:
-        return (note or "Du har inga kort kvar.", None, None)
+        return (note or "Du har inga kort kvar."), None, None, 0
     pages = math.ceil(len(hand) / 25)
     page = max(0, min(page, pages - 1))
-    turn = "**Det är din tur.**" if game.started and not game.finished and game.current == uid else "Inte din tur."
     text = f"{note}\n" if note else ""
-    text += f"Din hand ({len(hand)} kort). Översta kortet: {game.top.label}. {turn}"
+    text += f"Din hand ({len(hand)} kort). Översta kortet: {game.top.label}."
     if pages > 1:
         text += f"\nSida {page + 1}/{pages} i dropdown-menyn."
-    return text, cards.render_hand(hand), HandView(game.channel_id, hand, page)
+    return text, cards.render_hand(hand), HandView(game.channel_id, hand, page), page
 
 
 async def send_hand(interaction: discord.Interaction, game: Game, note: str = "") -> None:
-    text, png, view = hand_parts(game, interaction.user.id, 0, note)
+    text, png, view, page = hand_parts(game, interaction.user.id, 0, note)
     kwargs = {"content": text, "ephemeral": True}
     if png:
         kwargs["file"] = png_file(png, "hand.png")
     if view:
         kwargs["view"] = view
     await interaction.response.send_message(**kwargs)
+    game.hand_ix[interaction.user.id] = (interaction, page)  # så att handen kan uppdateras live
 
 
 async def refresh_hand(interaction: discord.Interaction, game: Game, page: int, note: str) -> None:
     """Uppdaterar det privata handmeddelandet som knappen/dropdownen sitter i."""
-    text, png, view = hand_parts(game, interaction.user.id, page, note)
+    text, png, view, page = hand_parts(game, interaction.user.id, page, note)
     await interaction.response.edit_message(
         content=text, attachments=[png_file(png, "hand.png")] if png else [], view=view
     )
+    game.hand_ix[interaction.user.id] = (interaction, page)
+
+
+async def refresh_all_hands(game: Game, skip: int | None = None) -> None:
+    """Uppdaterar allas öppna handvyer. Discord tillåter det i ca 15 min efter spelarens senaste klick;
+    går det inte längre trycker spelaren på 'Visa min hand' igen."""
+    for uid, (ix, page) in list(game.hand_ix.items()):
+        if uid == skip or uid not in game.hands:
+            continue
+        text, png, view, page = hand_parts(game, uid, page)
+        try:
+            await ix.edit_original_response(
+                content=text, attachments=[png_file(png, "hand.png")] if png else [], view=view
+            )
+            game.hand_ix[uid] = (ix, page)
+        except Exception:  # utgången token, borttaget meddelande osv.
+            logging.exception("Kunde inte uppdatera handen för %s", uid)
+            game.hand_ix.pop(uid, None)
+
+
+async def after_event(game: Game, channel: discord.abc.Messageable, event: str, skip: int | None = None) -> None:
+    await post_table(game, channel, event)
+    await refresh_all_hands(game, skip)
 
 
 def find_game(interaction: discord.Interaction) -> Game | None:
@@ -91,9 +114,20 @@ def find_game(interaction: discord.Interaction) -> Game | None:
 
 # ---------------------------------------------------------------- vyer
 class TableView(discord.ui.View):
-    def __init__(self, channel_id: int):
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
+        logging.exception("Fel i bordsvyn", exc_info=error)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send("Något gick fel.", ephemeral=True)
+            else:
+                await interaction.response.send_message("Något gick fel.", ephemeral=True)
+        except discord.HTTPException:
+            pass
+
+    def __init__(self, channel_id: int, seq: int, can_penalize: bool):
         super().__init__(timeout=None)
-        self.channel_id = channel_id
+        self.channel_id, self.seq = channel_id, seq
+        self.not_your_turn.disabled = self.wrong_card.disabled = not can_penalize
 
     @discord.ui.button(label="Visa min hand", emoji="🃏", style=discord.ButtonStyle.primary)
     async def show_hand(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -103,8 +137,38 @@ class TableView(discord.ui.View):
             return
         await send_hand(interaction, game)
 
+    async def _judge(self, interaction: discord.Interaction, reason: str) -> None:
+        game = games.get(self.channel_id)
+        if game is None:
+            await interaction.response.send_message("Spelet är slut.", ephemeral=True)
+            return
+        out = game.penalize_last(self.seq, interaction.user.id, reason)
+        if not out.ok:
+            await interaction.response.send_message(out.private, ephemeral=True)
+            return
+        await interaction.response.defer()
+        await after_event(game, interaction.channel, out.event)
+
+    @discord.ui.button(label="Inte din tur", emoji="⚠️", style=discord.ButtonStyle.danger)
+    async def not_your_turn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._judge(interaction, "Inte din tur")
+
+    @discord.ui.button(label="Fel kort", emoji="⚠️", style=discord.ButtonStyle.danger)
+    async def wrong_card(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._judge(interaction, "Fel kort")
+
 
 class HandView(discord.ui.View):
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
+        logging.exception("Fel i handvyn", exc_info=error)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send("Något gick fel, tryck på Visa min hand igen.", ephemeral=True)
+            else:
+                await interaction.response.send_message("Något gick fel, tryck på Visa min hand igen.", ephemeral=True)
+        except discord.HTTPException:
+            pass
+
     def __init__(self, channel_id: int, hand: list, page: int):
         super().__init__(timeout=900)
         self.channel_id, self.page = channel_id, page
@@ -122,6 +186,9 @@ class HandView(discord.ui.View):
         draw = discord.ui.Button(label="Dra kort", emoji="➕", style=discord.ButtonStyle.secondary, row=1)
         draw.callback = self.on_draw
         self.add_item(draw)
+        pass_btn = discord.ui.Button(label="Passa", emoji="⏭️", style=discord.ButtonStyle.secondary, row=1)
+        pass_btn.callback = self.on_pass
+        self.add_item(pass_btn)
         if pages > 1:
             prev = discord.ui.Button(label="◀", disabled=page == 0, row=1)
             nxt = discord.ui.Button(label="▶", disabled=page >= pages - 1, row=1)
@@ -129,31 +196,42 @@ class HandView(discord.ui.View):
             self.add_item(prev)
             self.add_item(nxt)
 
-    async def _finish(self, interaction: discord.Interaction, game: Game, out: Outcome) -> None:
+    async def _act(self, interaction: discord.Interaction, action: str, card_id: str = "") -> None:
+        game = games.get(self.channel_id)
+        if game is None:
+            await interaction.response.edit_message(content="Spelet är slut.", attachments=[], view=None)
+            return
+        uid = interaction.user.id
+        out: Outcome = {
+            "play": lambda: game.play(uid, card_id),
+            "draw": lambda: game.draw(uid),
+            "pass": lambda: game.pass_turn(uid),
+        }[action]()
         await refresh_hand(interaction, game, self.page, out.private)
         if out.event:
-            await post_table(game, interaction.channel, out.event)
+            await after_event(game, interaction.channel, out.event, skip=uid)
 
     async def on_select(self, interaction: discord.Interaction):
-        game = games.get(self.channel_id)
-        if game is None:
-            await interaction.response.edit_message(content="Spelet är slut.", attachments=[], view=None)
-            return
-        card_id = interaction.data["values"][0]
-        await self._finish(interaction, game, game.play(interaction.user.id, card_id))
+        await self._act(interaction, "play", interaction.data["values"][0])
 
     async def on_draw(self, interaction: discord.Interaction):
+        await self._act(interaction, "draw")
+
+    async def on_pass(self, interaction: discord.Interaction):
+        await self._act(interaction, "pass")
+
+    async def _turn_page(self, interaction: discord.Interaction, delta: int) -> None:
         game = games.get(self.channel_id)
         if game is None:
             await interaction.response.edit_message(content="Spelet är slut.", attachments=[], view=None)
             return
-        await self._finish(interaction, game, game.draw(interaction.user.id))
+        await refresh_hand(interaction, game, self.page + delta, "")
 
     async def on_prev(self, interaction: discord.Interaction):
-        await refresh_hand(interaction, games[self.channel_id], self.page - 1, "")
+        await self._turn_page(interaction, -1)
 
     async def on_next(self, interaction: discord.Interaction):
-        await refresh_hand(interaction, games[self.channel_id], self.page + 1, "")
+        await self._turn_page(interaction, 1)
 
 
 # ---------------------------------------------------------------- bot och kommandon
@@ -175,6 +253,19 @@ class MaoBot(discord.Client):
 
 
 bot = MaoBot()
+
+
+@bot.tree.error
+async def on_app_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    logging.exception("Kommandofel", exc_info=error)
+    msg = "Något gick fel i boten. Försök igen."
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except discord.HTTPException:
+        pass
 mao = app_commands.Group(name="mao", description="Kortspelet Mao", guild_only=True)
 
 
@@ -208,8 +299,8 @@ async def delta(interaction: discord.Interaction):
 
 
 @mao.command(name="starta", description="Dela ut och starta rundan (regelhållare)")
-@app_commands.describe(kort="Antal kort per spelare (standard 7)")
-async def starta(interaction: discord.Interaction, kort: app_commands.Range[int, 3, 12] = 7):
+@app_commands.describe(kort="Antal kort per spelare (standard 5)")
+async def starta(interaction: discord.Interaction, kort: app_commands.Range[int, 3, 12] = 5):
     game = find_game(interaction)
     if game is None or interaction.user.id not in game.keepers:
         await interaction.response.send_message("Bara regelhållaren kan starta, och det måste finnas ett spel.", ephemeral=True)
@@ -218,8 +309,13 @@ async def starta(interaction: discord.Interaction, kort: app_commands.Range[int,
     if error:
         await interaction.response.send_message(error, ephemeral=True)
         return
-    await interaction.response.send_message("Korten är utdelade. Lycka till! (Tryck på **Visa min hand** nedan.)")
+    await interaction.response.send_message(
+        f"Korten är utdelade! **{game.name(game.players[0])}** börjar.\n"
+        f"Så sitter ni i cirkeln: {game.order_text(with_counts=False)}\n"
+        "Ni avgör själva vems tur det är och vad som är rätt. Regelhållarna dömer. Tryck på **Visa min hand** nedan."
+    )
     await post_table(game, interaction.channel)
+    await refresh_all_hands(game)
 
 
 @mao.command(name="hand", description="Visa din hand (bara du ser den)")
@@ -287,13 +383,14 @@ async def slut(interaction: discord.Interaction):
 
 @bot.tree.command(name="straff", description="Dela ut ett straffkort (regelhållare)")
 @app_commands.guild_only()
-@app_commands.describe(spelare="Vem som får straffkortet", anledning="Kort och vag anledning", egen_text="Egen anledning (ersätter listan)")
+@app_commands.describe(spelare="Vem som får straffkortet", anledning="Kort och vag anledning", egen_text="Egen anledning (ersätter listan)", ta_tillbaka="Ta tillbaka spelarens senaste kort (om det var senaste draget)")
 @app_commands.choices(anledning=[app_commands.Choice(name=r, value=r) for r in REASONS])
 async def straff(
     interaction: discord.Interaction,
     spelare: discord.Member,
     anledning: Optional[app_commands.Choice[str]] = None,
     egen_text: Optional[str] = None,
+    ta_tillbaka: bool = False,
 ):
     game = find_game(interaction)
     if game is None or not game.started or game.finished:
@@ -309,9 +406,15 @@ async def straff(
     if not reason:
         await interaction.response.send_message("Välj en anledning eller skriv en egen.", ephemeral=True)
         return
-    out = game.penalty(spelare.id, reason[:80])
+    if ta_tillbaka:
+        out = game.penalize_last(game.seq, interaction.user.id, reason[:80], target=spelare.id)
+        if not out.ok:
+            await interaction.response.send_message(out.private, ephemeral=True)
+            return
+    else:
+        out = game.penalty(spelare.id, reason[:80])
     await interaction.response.send_message("Straffkort utdelat.", ephemeral=True)
-    await post_table(game, interaction.channel, out.event)
+    await after_event(game, interaction.channel, out.event)
 
 
 bot.tree.add_command(mao)
