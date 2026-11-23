@@ -115,7 +115,7 @@ class Game:
         deck = [Card(s, r, d) for d in range(decks) for s in SUITS for r in RANKS]
         random.shuffle(deck)
         self.hands = {p: [deck.pop() for _ in range(cards_each)] for p in self.players}
-        self.pile = [deck.pop()]
+        self.pile = []
         self.draw_pile = deck
         self.started, self.finished, self.winner = True, False, None
         self.last = None
@@ -125,8 +125,8 @@ class Game:
 
     # ---------- hjälpare ----------
     @property
-    def top(self) -> Card:
-        return self.pile[-1]
+    def top(self) -> Card | None:
+        return self.pile[-1] if self.pile else None
 
     def name(self, uid: int) -> str:
         return self.names.get(uid, str(uid))
