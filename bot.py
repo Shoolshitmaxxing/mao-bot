@@ -24,6 +24,8 @@ games: dict[int, Game] = {}  # kanal-id -> spel (ligger i minnet, försvinner vi
 
 # ---------------------------------------------------------------- hjälpare
 def png_file(data: bytes, name: str) -> discord.File:
+    if not data or len(data) < 8 or data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError(f"Ogiltig PNG-data for {name}")
     return discord.File(io.BytesIO(data), filename=name)
 
 
@@ -48,7 +50,12 @@ async def post_table(game: Game, channel: discord.abc.Messageable, event: str = 
     game.table_msg = await channel.send(
         content=table_text(game, event),
         file=png_file(cards.render_top(game.top), "pile.png"),
-        view=TableView(game.channel_id, game.seq, game.last is not None),
+        view=TableView(
+            game.channel_id,
+            game.seq,
+            game.last is not None,
+            game.last_judgment is not None,
+        ),
     )
 
 
@@ -124,10 +131,11 @@ class TableView(discord.ui.View):
         except discord.HTTPException:
             pass
 
-    def __init__(self, channel_id: int, seq: int, can_penalize: bool):
+    def __init__(self, channel_id: int, seq: int, can_penalize: bool, can_undo_judgment: bool):
         super().__init__(timeout=None)
         self.channel_id, self.seq = channel_id, seq
         self.not_your_turn.disabled = self.wrong_card.disabled = not can_penalize
+        self.wrong_judgment.disabled = not can_undo_judgment
 
     @discord.ui.button(label="Visa min hand", emoji="🃏", style=discord.ButtonStyle.primary)
     async def show_hand(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -156,6 +164,19 @@ class TableView(discord.ui.View):
     @discord.ui.button(label="Fel kort", emoji="⚠️", style=discord.ButtonStyle.danger)
     async def wrong_card(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._judge(interaction, "Fel kort")
+
+    @discord.ui.button(label="Felbedömning", emoji="↩️", style=discord.ButtonStyle.secondary)
+    async def wrong_judgment(self, interaction: discord.Interaction, button: discord.ui.Button):
+        game = games.get(self.channel_id)
+        if game is None:
+            await interaction.response.send_message("Spelet är slut.", ephemeral=True)
+            return
+        out = game.undo_last_judgment(interaction.user.id)
+        if not out.ok:
+            await interaction.response.send_message(out.private, ephemeral=True)
+            return
+        await interaction.response.defer()
+        await after_event(game, interaction.channel, out.event)
 
 
 class HandView(discord.ui.View):
@@ -310,9 +331,9 @@ async def starta(interaction: discord.Interaction, kort: app_commands.Range[int,
         await interaction.response.send_message(error, ephemeral=True)
         return
     await interaction.response.send_message(
-        f"Korten är utdelade! **{game.name(game.players[0])}** börjar.\n"
+        "Korten är utdelade!\n"
         f"Så sitter ni i cirkeln: {game.order_text(with_counts=False)}\n"
-        "Ni avgör själva vems tur det är och vad som är rätt. Regelhållarna dömer. Tryck på **Visa min hand** nedan."
+        "Ni avgör själva vems tur det är och vad som är rätt. Alla spelare kan döma. Tryck på **Visa min hand** nedan."
     )
     await post_table(game, interaction.channel)
     await refresh_all_hands(game)
@@ -381,7 +402,7 @@ async def slut(interaction: discord.Interaction):
     await interaction.response.send_message("Spelet är avslutat. Starta ett nytt med `/mao ny`.")
 
 
-@bot.tree.command(name="straff", description="Dela ut ett straffkort (regelhållare)")
+@bot.tree.command(name="straff", description="Dela ut ett straffkort")
 @app_commands.guild_only()
 @app_commands.describe(spelare="Vem som får straffkortet", anledning="Kort och vag anledning", egen_text="Egen anledning (ersätter listan)", ta_tillbaka="Ta tillbaka spelarens senaste kort (om det var senaste draget)")
 @app_commands.choices(anledning=[app_commands.Choice(name=r, value=r) for r in REASONS])
@@ -396,8 +417,8 @@ async def straff(
     if game is None or not game.started or game.finished:
         await interaction.response.send_message("Inget pågående spel här.", ephemeral=True)
         return
-    if interaction.user.id not in game.keepers:
-        await interaction.response.send_message("Bara regelhållare kan dela ut straffkort.", ephemeral=True)
+    if interaction.user.id not in game.players:
+        await interaction.response.send_message("Bara spelare i spelet kan dela ut straffkort.", ephemeral=True)
         return
     if spelare.id not in game.players:
         await interaction.response.send_message("Den spelaren är inte med i spelet.", ephemeral=True)
@@ -412,7 +433,7 @@ async def straff(
             await interaction.response.send_message(out.private, ephemeral=True)
             return
     else:
-        out = game.penalty(spelare.id, reason[:80])
+        out = game.penalty(spelare.id, reason[:80], judge_uid=interaction.user.id)
     await interaction.response.send_message("Straffkort utdelat.", ephemeral=True)
     await after_event(game, interaction.channel, out.event)
 
