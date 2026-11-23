@@ -186,10 +186,12 @@ class Game:
         self.seq = judgment.seq + 1
         judge_name = self.name(judgment.judge_uid)
         reason = judgment.reason
+        drawn = self._draw(judgment.judge_uid, 1)
         self.last_judgment = None
+        penalty = " får ett straffkort för felbedömningen." if drawn else ", men leken är tom och inget straffkort kunde dras."
         return Outcome(
             True,
-            event=f"Felbedömning: **{judge_name}**s dömning (*{reason}*) har ångrats.",
+            event=f"Felbedömning: **{judge_name}**s dömning (*{reason}*) har ångrats.{penalty}",
         )
 
     # ---------- handlingar ----------
