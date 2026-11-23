@@ -110,7 +110,7 @@ async def refresh_hand(interaction: discord.Interaction, game: Game, page: int, 
 
 async def refresh_all_hands(game: Game, skip: int | None = None) -> None:
     """Uppdaterar allas öppna handvyer. Discord tillåter det i ca 15 min efter spelarens senaste klick;
-    går det inte längre trycker spelaren på 'Visa min hand' igen."""
+    går det inte längre använder spelaren `/mao hand` igen."""
     for uid, (ix, page) in list(game.hand_ix.items()):
         if uid == skip or uid not in game.hands:
             continue
@@ -278,14 +278,6 @@ class TableView(discord.ui.View):
         self.not_your_turn.disabled = not can_penalize
         self.wrong_judgment.disabled = not can_undo_judgment
 
-    @discord.ui.button(label="Visa min hand", emoji="🃏", style=discord.ButtonStyle.primary)
-    async def show_hand(self, interaction: discord.Interaction, button: discord.ui.Button):
-        game = games.get(self.channel_id)
-        if game is None or interaction.user.id not in game.players:
-            await interaction.response.send_message("Du är inte med i det här spelet.", ephemeral=True)
-            return
-        await send_hand(interaction, game)
-
     async def _judge(self, interaction: discord.Interaction, reason: str, take_back: bool = True) -> None:
         game = games.get(self.channel_id)
         if game is None:
@@ -354,9 +346,9 @@ class HandView(discord.ui.View):
         logging.exception("Fel i handvyn", exc_info=error)
         try:
             if interaction.response.is_done():
-                await interaction.followup.send("Något gick fel, tryck på Visa min hand igen.", ephemeral=True)
+                await interaction.followup.send("Något gick fel, använd `/mao hand` igen.", ephemeral=True)
             else:
-                await interaction.response.send_message("Något gick fel, tryck på Visa min hand igen.", ephemeral=True)
+                await interaction.response.send_message("Något gick fel, använd `/mao hand` igen.", ephemeral=True)
         except discord.HTTPException:
             pass
 
@@ -505,10 +497,19 @@ async def starta(interaction: discord.Interaction, kort: app_commands.Range[int,
         f"Så sitter ni i cirkeln: {game.order_text(with_counts=False)}\n"
         "Högen är tom från början; en spelare lägger första kortet från sin hand. "
         "Ni avgör själva vems tur det är och vad som är rätt. Alla spelare kan döma. "
-        "Tryck på **Visa min hand** nedan."
+        "Använd `/mao hand` för att öppna din privata hand."
     )
     await post_table(game, interaction.channel)
     await refresh_all_hands(game)
+
+
+@mao.command(name="hand", description="Visa din hand privat")
+async def hand(interaction: discord.Interaction):
+    game = find_game(interaction)
+    if game is None or interaction.user.id not in game.players or not game.started:
+        await interaction.response.send_message("Du är inte med i ett pågående spel här.", ephemeral=True)
+        return
+    await send_hand(interaction, game)
 
 
 @mao.command(name="slut", description="Avsluta spelet (regelhållare)")
