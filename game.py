@@ -192,6 +192,21 @@ class Game:
         )
 
     # ---------- handlingar ----------
+    def penalty(self, uid: int, judge_uid: int, reason: str) -> Outcome:
+        if not self.started or uid not in self.players or judge_uid not in self.players:
+            return Outcome(False, private="Både den som dömer och spelaren som straffas måste vara med.")
+        snapshot = self._judgment_snapshot(judge_uid, reason)
+        if not self._draw(uid, 1):
+            return Outcome(False, private="Leken är tom, så inget straffkort kunde dras.")
+        if uid == self.winner:
+            self.finished, self.winner = False, None
+        self.last, self.seq = None, self.seq + 1
+        self.last_judgment = snapshot
+        return Outcome(
+            True,
+            event=f"**{self.name(uid)}** får ett straffkort: *{reason}*.",
+        )
+
     def play(self, uid: int, card_id: str) -> Outcome:
         if not self._active(uid):
             return Outcome(False, private="Du är inte med i ett pågående spel.")
