@@ -68,6 +68,10 @@ class LastJudgment:
     winner: int | None
     last: LastAction | None
     seq: int
+    target_uid: int | None = None
+    award_card: Card | None = None
+    card_holder_uid: int | None = None
+    is_undo: bool = False
 
 
 @dataclass
@@ -183,6 +187,17 @@ class Game:
         if judgment is None:
             return Outcome(False, private="Det finns ingen dömning att felbedöma.")
         undo_snapshot = self._judgment_snapshot(uid, f"Felbedömning av {judgment.reason}")
+        undo_snapshot.target_uid = judgment.target_uid
+        undo_snapshot.award_card = judgment.award_card
+        undo_snapshot.card_holder_uid = next(
+            (
+                player
+                for player, hand in self.hands.items()
+                if judgment.award_card is not None and judgment.award_card in hand
+            ),
+            None,
+        )
+        undo_snapshot.is_undo = True
         self.hands = {player: list(hand) for player, hand in judgment.hands.items()}
         self.draw_pile = list(judgment.draw_pile)
         self.pile = list(judgment.pile)
@@ -192,9 +207,19 @@ class Game:
         self.seq = judgment.seq + 1
         judge_name = self.name(judgment.judge_uid)
         reason = judgment.reason
-        drawn = self._draw(judgment.judge_uid, 1)
+        if judgment.is_undo:
+            holder = self.name(judgment.card_holder_uid) if judgment.card_holder_uid is not None else "den andra spelaren"
+            penalty = f" Kortet går tillbaka till **{holder}**; inget nytt kort dras."
+        elif judgment.award_card is not None:
+            if judgment.award_card in self.draw_pile:
+                self.draw_pile.remove(judgment.award_card)
+            elif judgment.award_card in self.pile:
+                self.pile.remove(judgment.award_card)
+            self.hands[judgment.judge_uid].append(judgment.award_card)
+            penalty = f" Kortet flyttas till **{judge_name}**; inget nytt kort dras."
+        else:
+            penalty = " Inget straffkort fanns att flytta."
         self.last_judgment = undo_snapshot
-        penalty = " får ett straffkort för felbedömningen." if drawn else ", men leken är tom och inget straffkort kunde dras."
         return Outcome(
             True,
             event=f"Felbedömning: **{judge_name}**s dömning (*{reason}*) har ångrats.{penalty}",
@@ -205,8 +230,12 @@ class Game:
         if not self.started or uid not in self.players or judge_uid not in self.players:
             return Outcome(False, private="Både den som dömer och spelaren som straffas måste vara med.")
         snapshot = self._judgment_snapshot(judge_uid, reason)
-        if not self._draw(uid, 1):
+        drawn = self._draw(uid, 1)
+        if not drawn:
             return Outcome(False, private="Leken är tom, så inget straffkort kunde dras.")
+        snapshot.target_uid = uid
+        snapshot.award_card = drawn[0]
+        snapshot.card_holder_uid = uid
         if uid == self.winner:
             self.finished, self.winner = False, None
         self.last, self.seq = None, self.seq + 1
@@ -274,6 +303,7 @@ class Game:
         if target is not None and act.uid != target:
             return Outcome(False, private="Den spelaren gjorde inte det senaste draget.")
         snapshot = self._judgment_snapshot(by_uid, reason)
+        snapshot.target_uid = act.uid
         if take_back and act.kind == "play" and act.card is not None:
             self.pile.pop()  # kortet går tillbaka till spelaren
             self.hands[act.uid].append(act.card)
@@ -284,7 +314,10 @@ class Game:
         if act.uid == self.winner:
             self.finished, self.winner = False, None
         self.last, self.seq = None, self.seq + 1
-        self._draw(act.uid, 1)
+        drawn = self._draw(act.uid, 1)
+        if drawn:
+            snapshot.award_card = drawn[0]
+            snapshot.card_holder_uid = act.uid
         self.last_judgment = snapshot
         extra = " Kortet tas tillbaka." if take_back and act.kind == "play" else ""
         return Outcome(True, event=f"**{self.name(act.uid)}** får ett straffkort: *{reason}*.{extra}")
