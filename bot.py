@@ -31,7 +31,8 @@ def png_file(data: bytes, name: str) -> discord.File:
 
 def table_text(game: Game, event: str = "") -> str:
     lines = [event] if event else []
-    lines.append(f"**Översta kortet:** {game.top.label}")
+    top = game.top
+    lines.append(f"**Översta kortet:** {top.label if top else 'inget ännu – första kortet läggs från handen'}")
     lines.append(f"**Ordning:** {game.order_text()}")
     return "\n".join(lines)
 
@@ -47,16 +48,21 @@ async def post_table(game: Game, channel: discord.abc.Messageable, event: str = 
         game.table_msg = None
         await channel.send(event + "\nStarta en ny runda med `/mao starta`.")
         return
-    game.table_msg = await channel.send(
-        content=table_text(game, event),
-        file=png_file(cards.render_top(game.top), "pile.png"),
-        view=TableView(
-            game.channel_id,
-            game.seq,
-            game.last is not None,
-            game.last_judgment is not None,
-        ),
+    view = TableView(
+        game.channel_id,
+        game.seq,
+        game.last is not None,
+        game.last_judgment is not None,
     )
+    top = game.top
+    if top is None:
+        game.table_msg = await channel.send(content=table_text(game, event), view=view)
+    else:
+        game.table_msg = await channel.send(
+            content=table_text(game, event),
+            file=png_file(cards.render_top(top), "pile.png"),
+            view=view,
+        )
 
 
 def hand_parts(game: Game, uid: int, page: int = 0, note: str = ""):
@@ -67,7 +73,9 @@ def hand_parts(game: Game, uid: int, page: int = 0, note: str = ""):
     pages = math.ceil(len(hand) / 25)
     page = max(0, min(page, pages - 1))
     text = f"{note}\n" if note else ""
-    text += f"Din hand ({len(hand)} kort). Översta kortet: {game.top.label}."
+    top = game.top
+    top_label = top.label if top else "inget ännu – lägg första kortet från handen"
+    text += f"Din hand ({len(hand)} kort). Översta kortet: {top_label}."
     if pages > 1:
         text += f"\nSida {page + 1}/{pages} i dropdown-menyn."
     return text, cards.render_hand(hand), HandView(game.channel_id, hand, page), page
@@ -333,7 +341,9 @@ async def starta(interaction: discord.Interaction, kort: app_commands.Range[int,
     await interaction.response.send_message(
         "Korten är utdelade!\n"
         f"Så sitter ni i cirkeln: {game.order_text(with_counts=False)}\n"
-        "Ni avgör själva vems tur det är och vad som är rätt. Alla spelare kan döma. Tryck på **Visa min hand** nedan."
+        "Högen är tom från början; en spelare lägger första kortet från sin hand. "
+        "Ni avgör själva vems tur det är och vad som är rätt. Alla spelare kan döma. "
+        "Tryck på **Visa min hand** nedan."
     )
     await post_table(game, interaction.channel)
     await refresh_all_hands(game)
