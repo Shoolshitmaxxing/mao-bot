@@ -136,9 +136,10 @@ def find_game(interaction: discord.Interaction) -> Game | None:
 
 # ---------------------------------------------------------------- vyer
 class PenaltyModal(discord.ui.Modal, title="Dela ut straffkort"):
-    def __init__(self, channel_id: int, seq: int):
+    def __init__(self, channel_id: int, seq: int, judge_uid: int, target_uid: int, take_back: bool):
         super().__init__(timeout=300)
         self.channel_id, self.seq = channel_id, seq
+        self.judge_uid, self.target_uid, self.take_back = judge_uid, target_uid, take_back
         self.reason = discord.ui.TextInput(
             label="Anledning",
             placeholder="Varför får spelaren ett straffkort?",
@@ -151,16 +152,113 @@ class PenaltyModal(discord.ui.Modal, title="Dela ut straffkort"):
         if game is None:
             await interaction.response.send_message("Spelet är slut.", ephemeral=True)
             return
+        if interaction.user.id != self.judge_uid:
+            await interaction.response.send_message("Bara den som öppnade straffmenyn kan skicka den.", ephemeral=True)
+            return
+        if game.seq != self.seq:
+            await interaction.response.send_message("Spelet har ändrats. Öppna straffmenyn igen.", ephemeral=True)
+            return
         reason = self.reason.value.strip()
         if not reason:
             await interaction.response.send_message("Skriv en anledning.", ephemeral=True)
             return
-        out = game.penalize_last(self.seq, interaction.user.id, reason, take_back=False)
+        if self.take_back:
+            if game.last is None or game.last.kind != "play" or game.last.uid != self.target_uid:
+                await interaction.response.send_message(
+                    "Kortet kan bara tas tillbaka från spelaren som lade det senast.",
+                    ephemeral=True,
+                )
+                return
+            out = game.penalize_last(
+                self.seq,
+                interaction.user.id,
+                reason,
+                target=self.target_uid,
+                take_back=True,
+            )
+        else:
+            out = game.penalty(self.target_uid, interaction.user.id, reason)
         if not out.ok:
             await interaction.response.send_message(out.private, ephemeral=True)
             return
-        await interaction.response.defer()
+        await interaction.response.defer(ephemeral=True)
         await after_event(game, interaction.channel, out.event)
+        await interaction.followup.send("Straffkort utdelat.", ephemeral=True)
+
+
+class PenaltyTargetView(discord.ui.View):
+    def __init__(self, channel_id: int, seq: int, judge_uid: int, reason: str | None):
+        super().__init__(timeout=180)
+        self.channel_id, self.seq, self.judge_uid = channel_id, seq, judge_uid
+        self.reason = reason
+        self.take_back = False
+
+        target = discord.ui.UserSelect(
+            placeholder="Välj spelaren som ska få straffkortet",
+            min_values=1,
+            max_values=1,
+        )
+        target.callback = self.select_target
+        self.add_item(target)
+
+        if reason is None:
+            self.take_back_button = discord.ui.Button(
+                label="Ta tillbaka kortet: Nej",
+                style=discord.ButtonStyle.secondary,
+            )
+            self.take_back_button.callback = self.toggle_take_back
+            self.add_item(self.take_back_button)
+
+    async def select_target(self, interaction: discord.Interaction):
+        game = games.get(self.channel_id)
+        if game is None or not game.started:
+            await interaction.response.send_message("Spelet är slut.", ephemeral=True)
+            return
+        if interaction.user.id != self.judge_uid or self.judge_uid not in game.players:
+            await interaction.response.send_message("Du är inte längre med i spelet.", ephemeral=True)
+            return
+        if game.seq != self.seq:
+            await interaction.response.send_message("Spelet har ändrats. Öppna straffmenyn igen.", ephemeral=True)
+            return
+        target_uid = int(interaction.data["values"][0])
+        if target_uid not in game.players:
+            await interaction.response.send_message("Den spelaren är inte med i spelet.", ephemeral=True)
+            return
+        if self.reason is not None:
+            out = game.penalty(target_uid, self.judge_uid, self.reason)
+            if not out.ok:
+                await interaction.response.send_message(out.private, ephemeral=True)
+                return
+            await interaction.response.defer(ephemeral=True)
+            await after_event(game, interaction.channel, out.event)
+            await interaction.followup.send("Straffkort utdelat.", ephemeral=True)
+            return
+        if self.take_back and (
+            game.last is None or game.last.kind != "play" or game.last.uid != target_uid
+        ):
+            await interaction.response.send_message(
+                "Kortet kan bara tas tillbaka från spelaren som lade det senast.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_modal(
+            PenaltyModal(
+                self.channel_id,
+                self.seq,
+                self.judge_uid,
+                target_uid,
+                self.take_back,
+            )
+        )
+
+    async def toggle_take_back(self, interaction: discord.Interaction):
+        game = games.get(self.channel_id)
+        if game is None or game.seq != self.seq:
+            await interaction.response.send_message("Spelet har ändrats. Öppna straffmenyn igen.", ephemeral=True)
+            return
+        self.take_back = not self.take_back
+        self.take_back_button.label = f"Ta tillbaka kortet: {'Ja' if self.take_back else 'Nej'}"
+        await interaction.response.edit_message(view=self)
 
 
 class TableView(discord.ui.View):
@@ -177,7 +275,7 @@ class TableView(discord.ui.View):
     def __init__(self, channel_id: int, seq: int, can_penalize: bool, can_undo_judgment: bool):
         super().__init__(timeout=None)
         self.channel_id, self.seq = channel_id, seq
-        self.not_your_turn.disabled = self.pratade.disabled = self.straff.disabled = not can_penalize
+        self.not_your_turn.disabled = not can_penalize
         self.wrong_judgment.disabled = not can_undo_judgment
 
     @discord.ui.button(label="Visa min hand", emoji="🃏", style=discord.ButtonStyle.primary)
@@ -204,23 +302,35 @@ class TableView(discord.ui.View):
     async def not_your_turn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._judge(interaction, "Inte din tur")
 
-    @discord.ui.button(label="Pratade", emoji="🗣️", style=discord.ButtonStyle.danger)
-    async def pratade(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._judge(interaction, "Pratade", take_back=False)
-
-    @discord.ui.button(label="Straff", emoji="⚠️", style=discord.ButtonStyle.danger)
-    async def straff(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _open_penalty_target(self, interaction: discord.Interaction, reason: str | None):
         game = games.get(self.channel_id)
-        if game is None:
+        if game is None or not game.started:
             await interaction.response.send_message("Spelet är slut.", ephemeral=True)
             return
         if interaction.user.id not in game.players:
             await interaction.response.send_message("Du är inte med i det här spelet.", ephemeral=True)
             return
-        if game.last is None or game.seq != self.seq:
-            await interaction.response.send_message("Det senaste draget har redan ändrats.", ephemeral=True)
+        if game.seq != self.seq:
+            await interaction.response.send_message("Spelet har ändrats. Använd knappen på det senaste bordsmeddelandet.", ephemeral=True)
             return
-        await interaction.response.send_modal(PenaltyModal(self.channel_id, self.seq))
+        prompt = (
+            "Välj vem som får straffkortet för att ha pratat."
+            if reason == "Pratade"
+            else "Välj spelare och om det senaste lagda kortet ska tas tillbaka."
+        )
+        await interaction.response.send_message(
+            prompt,
+            view=PenaltyTargetView(self.channel_id, self.seq, interaction.user.id, reason),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Pratade", emoji="🗣️", style=discord.ButtonStyle.danger)
+    async def pratade(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._open_penalty_target(interaction, "Pratade")
+
+    @discord.ui.button(label="Straff", emoji="⚠️", style=discord.ButtonStyle.danger)
+    async def straff(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._open_penalty_target(interaction, None)
 
     @discord.ui.button(label="Felbedömning", emoji="↩️", style=discord.ButtonStyle.secondary)
     async def wrong_judgment(self, interaction: discord.Interaction, button: discord.ui.Button):
