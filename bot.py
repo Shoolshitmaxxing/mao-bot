@@ -95,12 +95,8 @@ async def send_hand(interaction: discord.Interaction, game: Game, note: str = ""
         kwargs["file"] = png_file(png, "hand.png")
     if view:
         kwargs["view"] = view
-    if interaction.response.is_done():
-        message = await interaction.followup.send(**kwargs, wait=True)
-        game.hand_ix[interaction.user.id] = (message, page)
-    else:
-        await interaction.response.send_message(**kwargs)
-        game.hand_ix[interaction.user.id] = (interaction, page)
+    await interaction.response.send_message(**kwargs)
+    game.hand_ix[interaction.user.id] = (interaction, page)  # så att handen kan uppdateras live
 
 
 async def refresh_hand(interaction: discord.Interaction, game: Game, page: int, note: str) -> None:
@@ -114,21 +110,15 @@ async def refresh_hand(interaction: discord.Interaction, game: Game, page: int, 
 
 async def refresh_all_hands(game: Game, skip: int | None = None) -> None:
     """Uppdaterar allas öppna handvyer. Discord tillåter det i ca 15 min efter spelarens senaste klick;
-    går det inte längre använder spelaren `/mao hand` igen."""
+    går det inte längre trycker spelaren på 'Visa min hand' igen."""
     for uid, (ix, page) in list(game.hand_ix.items()):
         if uid == skip or uid not in game.hands:
             continue
         text, png, view, page = hand_parts(game, uid, page)
         try:
-            kwargs = {
-                "content": text,
-                "attachments": [png_file(png, "hand.png")] if png else [],
-                "view": view,
-            }
-            if isinstance(ix, discord.Interaction):
-                await ix.edit_original_response(**kwargs)
-            else:
-                await ix.edit(**kwargs)
+            await ix.edit_original_response(
+                content=text, attachments=[png_file(png, "hand.png")] if png else [], view=view
+            )
             game.hand_ix[uid] = (ix, page)
         except Exception:  # utgången token, borttaget meddelande osv.
             logging.exception("Kunde inte uppdatera handen för %s", uid)
@@ -364,9 +354,9 @@ class HandView(discord.ui.View):
         logging.exception("Fel i handvyn", exc_info=error)
         try:
             if interaction.response.is_done():
-                await interaction.followup.send("Något gick fel, använd `/mao hand` igen.", ephemeral=True)
+                await interaction.followup.send("Något gick fel, tryck på Visa min hand igen.", ephemeral=True)
             else:
-                await interaction.response.send_message("Något gick fel, använd `/mao hand` igen.", ephemeral=True)
+                await interaction.response.send_message("Något gick fel, tryck på Visa min hand igen.", ephemeral=True)
         except discord.HTTPException:
             pass
 
@@ -515,20 +505,10 @@ async def starta(interaction: discord.Interaction, kort: app_commands.Range[int,
         f"Så sitter ni i cirkeln: {game.order_text(with_counts=False)}\n"
         "Högen är tom från början; en spelare lägger första kortet från sin hand. "
         "Ni avgör själva vems tur det är och vad som är rätt. Alla spelare kan döma. "
-        "Den som startar får handen privat automatiskt. Övriga kan trycka **Visa min hand** "
-        "eller använda `/mao hand`; bara du ser ditt privata handmeddelande."
+        "Tryck på **Visa min hand** nedan."
     )
     await post_table(game, interaction.channel)
-    await send_hand(interaction, game)
-
-
-@mao.command(name="hand", description="Visa din hand privat")
-async def hand(interaction: discord.Interaction):
-    game = find_game(interaction)
-    if game is None or interaction.user.id not in game.players or not game.started:
-        await interaction.response.send_message("Du är inte med i ett pågående spel här.", ephemeral=True)
-        return
-    await send_hand(interaction, game)
+    await refresh_all_hands(game)
 
 
 @mao.command(name="slut", description="Avsluta spelet (regelhållare)")
