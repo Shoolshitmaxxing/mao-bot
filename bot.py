@@ -95,8 +95,12 @@ async def send_hand(interaction: discord.Interaction, game: Game, note: str = ""
         kwargs["file"] = png_file(png, "hand.png")
     if view:
         kwargs["view"] = view
-    await interaction.response.send_message(**kwargs)
-    game.hand_ix[interaction.user.id] = (interaction, page)  # så att handen kan uppdateras live
+    if interaction.response.is_done():
+        message = await interaction.followup.send(**kwargs, wait=True)
+        game.hand_ix[interaction.user.id] = (message, page)
+    else:
+        await interaction.response.send_message(**kwargs)
+        game.hand_ix[interaction.user.id] = (interaction, page)
 
 
 async def refresh_hand(interaction: discord.Interaction, game: Game, page: int, note: str) -> None:
@@ -116,9 +120,15 @@ async def refresh_all_hands(game: Game, skip: int | None = None) -> None:
             continue
         text, png, view, page = hand_parts(game, uid, page)
         try:
-            await ix.edit_original_response(
-                content=text, attachments=[png_file(png, "hand.png")] if png else [], view=view
-            )
+            kwargs = {
+                "content": text,
+                "attachments": [png_file(png, "hand.png")] if png else [],
+                "view": view,
+            }
+            if isinstance(ix, discord.Interaction):
+                await ix.edit_original_response(**kwargs)
+            else:
+                await ix.edit(**kwargs)
             game.hand_ix[uid] = (ix, page)
         except Exception:  # utgången token, borttaget meddelande osv.
             logging.exception("Kunde inte uppdatera handen för %s", uid)
@@ -277,6 +287,14 @@ class TableView(discord.ui.View):
         self.channel_id, self.seq = channel_id, seq
         self.not_your_turn.disabled = not can_penalize
         self.wrong_judgment.disabled = not can_undo_judgment
+
+    @discord.ui.button(label="Visa min hand", emoji="🃏", style=discord.ButtonStyle.primary)
+    async def show_hand(self, interaction: discord.Interaction, button: discord.ui.Button):
+        game = games.get(self.channel_id)
+        if game is None or interaction.user.id not in game.players:
+            await interaction.response.send_message("Du är inte med i det här spelet.", ephemeral=True)
+            return
+        await send_hand(interaction, game)
 
     async def _judge(self, interaction: discord.Interaction, reason: str, take_back: bool = True) -> None:
         game = games.get(self.channel_id)
@@ -497,10 +515,11 @@ async def starta(interaction: discord.Interaction, kort: app_commands.Range[int,
         f"Så sitter ni i cirkeln: {game.order_text(with_counts=False)}\n"
         "Högen är tom från början; en spelare lägger första kortet från sin hand. "
         "Ni avgör själva vems tur det är och vad som är rätt. Alla spelare kan döma. "
-        "Använd `/mao hand` för att öppna din privata hand."
+        "Den som startar får handen privat automatiskt. Övriga kan trycka **Visa min hand** "
+        "eller använda `/mao hand`; bara du ser ditt privata handmeddelande."
     )
     await post_table(game, interaction.channel)
-    await refresh_all_hands(game)
+    await send_hand(interaction, game)
 
 
 @mao.command(name="hand", description="Visa din hand privat")
