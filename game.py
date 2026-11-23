@@ -197,11 +197,22 @@ class Game:
     # ---------- handlingar ----------
     def penalty(self, uid: int, reason: str, judge_uid: int | None = None) -> Outcome:
         """Manuellt straffkort (utan att något kort tas tillbaka)."""
+        if not self.started or uid not in self.players:
+            return Outcome(False, private="Spelaren är inte med i ett pågående spel.")
         snapshot = self._judgment_snapshot(judge_uid if judge_uid is not None else uid, reason)
-        self._draw(uid, 1)
+        drawn = self._draw(uid, 1)
+        if not drawn:
+            return Outcome(False, private="Leken är tom, så inget straffkort kunde dras.")
+        if uid == self.winner:
+            self.finished, self.winner = False, None
+        self.last = None
         self.seq += 1
         self.last_judgment = snapshot
-        return Outcome(False, private=f"Straffkort: {reason}", event=f"**{self.name(uid)}** får ett straffkort: *{reason}*")
+        return Outcome(
+            True,
+            private=f"Du fick ett straffkort: {reason}",
+            event=f"**{self.name(uid)}** får ett straffkort: *{reason}*",
+        )
 
     def play(self, uid: int, card_id: str) -> Outcome:
         if not self._active(uid):
