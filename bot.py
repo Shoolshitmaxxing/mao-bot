@@ -1,6 +1,7 @@
 """Mao-bot för Discord (prototyp). Kör: python bot.py"""
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import math
@@ -19,6 +20,7 @@ GUILD_ID = os.getenv("GUILD_ID")  # valfritt: gör att kommandon dyker upp direk
 
 logging.basicConfig(level=logging.INFO)
 games: dict[int, Game] = {}  # kanal-id -> spel (ligger i minnet, försvinner vid omstart)
+game_creation_lock = asyncio.Lock()
 
 
 # ---------------------------------------------------------------- hjälpare
@@ -42,13 +44,15 @@ async def post_table(game: Game, channel: discord.abc.Messageable, event: str = 
         try:
             await game.table_msg.delete()
         except discord.HTTPException:
-            pass
+            logging.exception("Kunde inte ta bort föregående bordsmeddelande")
     if game.finished:
         view = TableView(
             game.channel_id,
             game.seq,
             game.last is not None,
             game.last_judgment is not None or game.last is not None,
+            game.round_id,
+            game.started and not game.finished,
         )
         game.table_msg = await channel.send(
             event + "\nStarta en ny runda med `/mao starta`. Om vinsten var fel, tryck **Felbedömning**.",
@@ -60,6 +64,8 @@ async def post_table(game: Game, channel: discord.abc.Messageable, event: str = 
         game.seq,
         game.last is not None,
         game.last_judgment is not None,
+        game.round_id,
+        game.started and not game.finished,
     )
     top = game.top
     if top is None:
@@ -85,10 +91,11 @@ def hand_parts(game: Game, uid: int, page: int = 0, note: str = ""):
     text += f"Din hand ({len(hand)} kort). Översta kortet: {top_label}."
     if pages > 1:
         text += f"\nSida {page + 1}/{pages} i dropdown-menyn."
-    return text, cards.render_hand(hand), HandView(game.channel_id, hand, page), page
+    return text, cards.render_hand(hand), HandView(game.channel_id, hand, page, game.round_id, game.seq), page
 
 
 async def send_hand(interaction: discord.Interaction, game: Game, note: str = "") -> None:
+    round_id, seq = game.round_id, game.seq
     text, png, view, page = hand_parts(game, interaction.user.id, 0, note)
     kwargs = {"content": text, "ephemeral": True}
     if png:
@@ -96,15 +103,34 @@ async def send_hand(interaction: discord.Interaction, game: Game, note: str = ""
     if view:
         kwargs["view"] = view
     await interaction.response.send_message(**kwargs)
-    game.hand_ix[interaction.user.id] = (interaction, page)  # så att handen kan uppdateras live
+    async with game.lock:
+        if games.get(game.channel_id) is not game or game.round_id != round_id:
+            await interaction.edit_original_response(
+                content="Den här handen tillhör en äldre runda. Öppna handen från det senaste bordsmeddelandet.",
+                attachments=[],
+                view=None,
+            )
+            return
+        if game.seq != seq:
+            text, png, view, page = hand_parts(game, interaction.user.id, page, "Spelet ändrades; handen har uppdaterats.")
+            game.hand_ix[interaction.user.id] = (interaction, page)
+            await interaction.edit_original_response(
+                content=text,
+                attachments=[png_file(png, "hand.png")] if png else [],
+                view=view,
+            )
+            return
+        game.hand_ix[interaction.user.id] = (interaction, page)
 
 
 async def refresh_hand(interaction: discord.Interaction, game: Game, page: int, note: str) -> None:
     """Uppdaterar det privata handmeddelandet som knappen/dropdownen sitter i."""
     text, png, view, page = hand_parts(game, interaction.user.id, page, note)
-    await interaction.response.edit_message(
-        content=text, attachments=[png_file(png, "hand.png")] if png else [], view=view
-    )
+    kwargs = {"content": text, "attachments": [png_file(png, "hand.png")] if png else [], "view": view}
+    if interaction.response.is_done():
+        await interaction.edit_original_response(**kwargs)
+    else:
+        await interaction.response.edit_message(**kwargs)
     game.hand_ix[interaction.user.id] = (interaction, page)
 
 
@@ -120,25 +146,57 @@ async def refresh_all_hands(game: Game, skip: int | None = None) -> None:
                 content=text, attachments=[png_file(png, "hand.png")] if png else [], view=view
             )
             game.hand_ix[uid] = (ix, page)
-        except Exception:  # utgången token, borttaget meddelande osv.
+        except discord.HTTPException:
             logging.exception("Kunde inte uppdatera handen för %s", uid)
             game.hand_ix.pop(uid, None)
 
 
 async def after_event(game: Game, channel: discord.abc.Messageable, event: str, skip: int | None = None) -> None:
+    vote = game.pending_vote
+    if vote is not None and vote.seq != game.seq:
+        await cancel_pending_vote(game, "Omröstningen avbröts eftersom spelet ändrades.")
     await post_table(game, channel, event)
     await refresh_all_hands(game, skip)
+
+
+async def cancel_pending_vote(game: Game, message: str) -> None:
+    vote = game.pending_vote
+    if vote is None:
+        return
+    game.pending_vote = None
+    vote.stop()
+    if vote.message is not None:
+        try:
+            await vote.message.edit(content=message, view=None)
+        except discord.HTTPException:
+            logging.exception("Kunde inte uppdatera det avbrutna röstmeddelandet")
 
 
 def find_game(interaction: discord.Interaction) -> Game | None:
     return games.get(interaction.channel_id)
 
 
+async def send_private(interaction: discord.Interaction, message: str) -> None:
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+
+
 # ---------------------------------------------------------------- vyer
 class PenaltyModal(discord.ui.Modal, title="Dela ut straffkort"):
-    def __init__(self, channel_id: int, seq: int, judge_uid: int, target_uid: int, take_back: bool):
+    def __init__(
+        self,
+        channel_id: int,
+        seq: int,
+        round_id: str,
+        judge_uid: int,
+        target_uid: int,
+        take_back: bool,
+    ):
         super().__init__(timeout=300)
         self.channel_id, self.seq = channel_id, seq
+        self.round_id = round_id
         self.judge_uid, self.target_uid, self.take_back = judge_uid, target_uid, take_back
         self.reason = discord.ui.TextInput(
             label="Anledning",
@@ -150,46 +208,50 @@ class PenaltyModal(discord.ui.Modal, title="Dela ut straffkort"):
     async def on_submit(self, interaction: discord.Interaction) -> None:
         game = games.get(self.channel_id)
         if game is None:
-            await interaction.response.send_message("Spelet är slut.", ephemeral=True)
-            return
-        if interaction.user.id != self.judge_uid:
-            await interaction.response.send_message("Bara den som öppnade straffmenyn kan skicka den.", ephemeral=True)
-            return
-        if game.seq != self.seq:
-            await interaction.response.send_message("Spelet har ändrats. Öppna straffmenyn igen.", ephemeral=True)
-            return
-        reason = self.reason.value.strip()
-        if not reason:
-            await interaction.response.send_message("Skriv en anledning.", ephemeral=True)
-            return
-        if self.take_back:
-            if game.last is None or game.last.kind != "play" or game.last.uid != self.target_uid:
-                await interaction.response.send_message(
-                    "Kortet kan bara tas tillbaka från spelaren som lade det senast.",
-                    ephemeral=True,
-                )
-                return
-            out = game.penalize_last(
-                self.seq,
-                interaction.user.id,
-                reason,
-                target=self.target_uid,
-                take_back=True,
-            )
-        else:
-            out = game.penalty(self.target_uid, interaction.user.id, reason)
-        if not out.ok:
-            await interaction.response.send_message(out.private, ephemeral=True)
+            await send_private(interaction, "Spelet är slut.")
             return
         await interaction.response.defer(ephemeral=True)
-        await after_event(game, interaction.channel, out.event)
-        await interaction.followup.send("Straffkort utdelat.", ephemeral=True)
+        async with game.lock:
+            if games.get(self.channel_id) is not game or game.round_id != self.round_id:
+                await send_private(interaction, "Den här straffmenyn tillhör en äldre runda.")
+                return
+            if interaction.user.id != self.judge_uid:
+                await send_private(interaction, "Bara den som öppnade straffmenyn kan skicka den.")
+                return
+            if game.seq != self.seq:
+                await send_private(interaction, "Spelet har ändrats. Öppna straffmenyn igen.")
+                return
+            reason = self.reason.value.strip()
+            if not reason:
+                await send_private(interaction, "Skriv en anledning.")
+                return
+            if self.take_back:
+                if game.last is None or game.last.kind != "play" or game.last.uid != self.target_uid:
+                    await send_private(
+                        interaction,
+                        "Kortet kan bara tas tillbaka från spelaren som lade det senast.",
+                    )
+                    return
+                out = game.penalize_last(
+                    self.seq,
+                    interaction.user.id,
+                    reason,
+                    target=self.target_uid,
+                    take_back=True,
+                )
+            else:
+                out = game.penalty(self.target_uid, interaction.user.id, reason)
+            if not out.ok:
+                await send_private(interaction, out.private)
+                return
+            await after_event(game, interaction.channel, out.event)
+            await interaction.followup.send("Straffkort utdelat.", ephemeral=True)
 
 
 class PenaltyTargetView(discord.ui.View):
-    def __init__(self, channel_id: int, seq: int, judge_uid: int, reason: str | None):
+    def __init__(self, channel_id: int, seq: int, round_id: str, judge_uid: int, reason: str | None):
         super().__init__(timeout=180)
-        self.channel_id, self.seq, self.judge_uid = channel_id, seq, judge_uid
+        self.channel_id, self.seq, self.round_id, self.judge_uid = channel_id, seq, round_id, judge_uid
         self.reason = reason
         self.take_back = False
 
@@ -212,48 +274,71 @@ class PenaltyTargetView(discord.ui.View):
     async def select_target(self, interaction: discord.Interaction):
         game = games.get(self.channel_id)
         if game is None or not game.started:
-            await interaction.response.send_message("Spelet är slut.", ephemeral=True)
+            await send_private(interaction, "Spelet är slut.")
             return
-        if interaction.user.id != self.judge_uid or self.judge_uid not in game.players:
-            await interaction.response.send_message("Du är inte längre med i spelet.", ephemeral=True)
-            return
-        if game.seq != self.seq:
-            await interaction.response.send_message("Spelet har ändrats. Öppna straffmenyn igen.", ephemeral=True)
-            return
-        target_uid = int(interaction.data["values"][0])
-        if target_uid not in game.players:
-            await interaction.response.send_message("Den spelaren är inte med i spelet.", ephemeral=True)
-            return
-        if self.reason is not None:
-            out = game.penalty(target_uid, self.judge_uid, self.reason)
-            if not out.ok:
-                await interaction.response.send_message(out.private, ephemeral=True)
+        reason = self.reason
+        if reason is None:
+            if (
+                games.get(self.channel_id) is not game
+                or game.round_id != self.round_id
+                or game.finished
+                or interaction.user.id != self.judge_uid
+                or self.judge_uid not in game.players
+                or game.seq != self.seq
+            ):
+                await send_private(interaction, "Spelet har ändrats. Öppna straffmenyn igen.")
                 return
-            await interaction.response.defer(ephemeral=True)
+            target_uid = int(interaction.data["values"][0])
+            if target_uid not in game.players:
+                await send_private(interaction, "Den spelaren är inte med i spelet.")
+                return
+            if self.take_back and (
+                game.last is None or game.last.kind != "play" or game.last.uid != target_uid
+            ):
+                await interaction.response.send_message(
+                    "Kortet kan bara tas tillbaka från spelaren som lade det senast.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.send_modal(
+                PenaltyModal(
+                    self.channel_id,
+                    self.seq,
+                    self.round_id,
+                    self.judge_uid,
+                    target_uid,
+                    self.take_back,
+                )
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        async with game.lock:
+            if games.get(self.channel_id) is not game or game.round_id != self.round_id:
+                await send_private(interaction, "Den här straffmenyn tillhör en äldre runda.")
+                return
+            if game.finished:
+                await send_private(interaction, "Spelet är slut.")
+                return
+            if interaction.user.id != self.judge_uid or self.judge_uid not in game.players:
+                await send_private(interaction, "Du är inte längre med i spelet.")
+                return
+            if game.seq != self.seq:
+                await send_private(interaction, "Spelet har ändrats. Öppna straffmenyn igen.")
+                return
+            target_uid = int(interaction.data["values"][0])
+            if target_uid not in game.players:
+                await send_private(interaction, "Den spelaren är inte med i spelet.")
+                return
+            out = game.penalty(target_uid, self.judge_uid, reason)
+            if not out.ok:
+                await send_private(interaction, out.private)
+                return
             await after_event(game, interaction.channel, out.event)
             await interaction.followup.send("Straffkort utdelat.", ephemeral=True)
-            return
-        if self.take_back and (
-            game.last is None or game.last.kind != "play" or game.last.uid != target_uid
-        ):
-            await interaction.response.send_message(
-                "Kortet kan bara tas tillbaka från spelaren som lade det senast.",
-                ephemeral=True,
-            )
-            return
-        await interaction.response.send_modal(
-            PenaltyModal(
-                self.channel_id,
-                self.seq,
-                self.judge_uid,
-                target_uid,
-                self.take_back,
-            )
-        )
 
     async def toggle_take_back(self, interaction: discord.Interaction):
         game = games.get(self.channel_id)
-        if game is None or game.seq != self.seq:
+        if game is None or game.round_id != self.round_id or game.seq != self.seq:
             await interaction.response.send_message("Spelet har ändrats. Öppna straffmenyn igen.", ephemeral=True)
             return
         self.take_back = not self.take_back
@@ -272,17 +357,31 @@ class TableView(discord.ui.View):
         except discord.HTTPException:
             pass
 
-    def __init__(self, channel_id: int, seq: int, can_penalize: bool, can_undo_judgment: bool):
+    def __init__(
+        self,
+        channel_id: int,
+        seq: int,
+        can_penalize: bool,
+        can_undo_judgment: bool,
+        round_id: str,
+        active: bool,
+    ):
         super().__init__(timeout=None)
-        self.channel_id, self.seq = channel_id, seq
+        self.channel_id, self.seq, self.round_id = channel_id, seq, round_id
         self.not_your_turn.disabled = not can_penalize
         self.wrong_judgment.disabled = not can_undo_judgment
+        self.pratade.disabled = not active
+        self.straff.disabled = not active
+        self.propose_card.disabled = not active
 
     @discord.ui.button(label="Visa min hand", emoji="🃏", style=discord.ButtonStyle.primary)
     async def show_hand(self, interaction: discord.Interaction, button: discord.ui.Button):
         game = games.get(self.channel_id)
         if game is None or interaction.user.id not in game.players:
             await interaction.response.send_message("Du är inte med i det här spelet.", ephemeral=True)
+            return
+        if game.round_id != self.round_id:
+            await interaction.response.send_message("Det här bordsmeddelandet tillhör en äldre runda.", ephemeral=True)
             return
         await send_hand(interaction, game)
 
@@ -291,12 +390,20 @@ class TableView(discord.ui.View):
         if game is None:
             await interaction.response.send_message("Spelet är slut.", ephemeral=True)
             return
-        out = game.penalize_last(self.seq, interaction.user.id, reason, take_back=take_back)
-        if not out.ok:
-            await interaction.response.send_message(out.private, ephemeral=True)
-            return
         await interaction.response.defer()
-        await after_event(game, interaction.channel, out.event)
+        async with game.lock:
+            if (
+                games.get(self.channel_id) is not game
+                or game.round_id != self.round_id
+                or game.seq != self.seq
+            ):
+                await send_private(interaction, "Spelet har ändrats. Använd knappen på det senaste bordsmeddelandet.")
+                return
+            out = game.penalize_last(self.seq, interaction.user.id, reason, take_back=take_back)
+            if not out.ok:
+                await send_private(interaction, out.private)
+                return
+            await after_event(game, interaction.channel, out.event)
 
     @discord.ui.button(label="Inte din tur", emoji="⚠️", style=discord.ButtonStyle.danger)
     async def not_your_turn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -304,13 +411,13 @@ class TableView(discord.ui.View):
 
     async def _open_penalty_target(self, interaction: discord.Interaction, reason: str | None):
         game = games.get(self.channel_id)
-        if game is None or not game.started:
+        if game is None or not game.started or game.finished:
             await interaction.response.send_message("Spelet är slut.", ephemeral=True)
             return
         if interaction.user.id not in game.players:
             await interaction.response.send_message("Du är inte med i det här spelet.", ephemeral=True)
             return
-        if game.seq != self.seq:
+        if game.round_id != self.round_id or game.seq != self.seq:
             await interaction.response.send_message("Spelet har ändrats. Använd knappen på det senaste bordsmeddelandet.", ephemeral=True)
             return
         prompt = (
@@ -320,7 +427,7 @@ class TableView(discord.ui.View):
         )
         await interaction.response.send_message(
             prompt,
-            view=PenaltyTargetView(self.channel_id, self.seq, interaction.user.id, reason),
+            view=PenaltyTargetView(self.channel_id, self.seq, self.round_id, interaction.user.id, reason),
             ephemeral=True,
         )
 
@@ -332,21 +439,170 @@ class TableView(discord.ui.View):
     async def straff(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._open_penalty_target(interaction, None)
 
+    @discord.ui.button(label="Föreslå nytt kort", emoji="🗳️", style=discord.ButtonStyle.primary)
+    async def propose_card(self, interaction: discord.Interaction, button: discord.ui.Button):
+        game = games.get(self.channel_id)
+        if game is None:
+            await interaction.response.send_message("Spelet är slut.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        async with game.lock:
+            if (
+                games.get(self.channel_id) is not game
+                or game.round_id != self.round_id
+                or game.seq != self.seq
+                or game.finished
+            ):
+                await send_private(interaction, "Spelet har ändrats. Använd knappen på det senaste bordsmeddelandet.")
+                return
+            if interaction.user.id not in game.players:
+                await send_private(interaction, "Du är inte med i det här spelet.")
+                return
+            if game.pending_vote is not None:
+                await send_private(interaction, "En omröstning pågår redan.")
+                return
+            vote = NewCardVoteView(game.channel_id, game.round_id, game.seq, interaction.user.id)
+            game.pending_vote = vote
+            try:
+                vote.message = await interaction.channel.send(content=vote.status_text(game), view=vote)
+            except discord.HTTPException:
+                game.pending_vote = None
+                vote.stop()
+                logging.exception("Kunde inte starta omröstningen")
+                await send_private(interaction, "Kunde inte starta omröstningen. Försök igen.")
+                return
+            await interaction.followup.send(
+                "Omröstningen startad. Ditt förslag räknas som en ja-röst.",
+                ephemeral=True,
+            )
+
     @discord.ui.button(label="Felbedömning", emoji="↩️", style=discord.ButtonStyle.secondary)
     async def wrong_judgment(self, interaction: discord.Interaction, button: discord.ui.Button):
         game = games.get(self.channel_id)
         if game is None:
             await interaction.response.send_message("Spelet är slut.", ephemeral=True)
             return
-        if game.finished and game.last is not None and game.last_judgment is None:
-            out = game.penalize_last(self.seq, interaction.user.id, "Felbedömning av vinst")
-        else:
-            out = game.undo_last_judgment(interaction.user.id)
-        if not out.ok:
-            await interaction.response.send_message(out.private, ephemeral=True)
-            return
         await interaction.response.defer()
-        await after_event(game, interaction.channel, out.event)
+        async with game.lock:
+            if (
+                games.get(self.channel_id) is not game
+                or game.round_id != self.round_id
+                or game.seq != self.seq
+            ):
+                await send_private(interaction, "Spelet har ändrats. Använd knappen på det senaste bordsmeddelandet.")
+                return
+            if game.finished and game.last is not None and game.last_judgment is None:
+                out = game.penalize_last(self.seq, interaction.user.id, "Felbedömning av vinst")
+            else:
+                out = game.undo_last_judgment(interaction.user.id)
+            if not out.ok:
+                await send_private(interaction, out.private)
+                return
+            await after_event(game, interaction.channel, out.event)
+
+
+class NewCardVoteView(discord.ui.View):
+    def __init__(self, channel_id: int, round_id: str, seq: int, proposer_uid: int):
+        super().__init__(timeout=20)
+        self.channel_id, self.round_id, self.seq = channel_id, round_id, seq
+        self.votes = {proposer_uid: True}
+        self.message: discord.Message | None = None
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
+        logging.exception("Fel i omröstningen", exc_info=error)
+        try:
+            await send_private(interaction, "Något gick fel i omröstningen.")
+        except discord.HTTPException:
+            logging.exception("Kunde inte visa omröstningsfelet för spelaren")
+
+    def status_text(self, game: Game) -> str:
+        yes = sum(self.votes.values())
+        no = len(self.votes) - yes
+        pending = len(game.players) - len(self.votes)
+        return (
+            f"Omröstning om att vända upp ett nytt kort. "
+            f"Ja: {yes} · Nej: {no} · Inte röstat: {pending}. "
+            "Omröstningen avslutas när alla röstat eller efter 20 sekunder."
+        )
+
+    async def _cast(self, interaction: discord.Interaction, approve: bool) -> None:
+        game = games.get(self.channel_id)
+        if game is None:
+            await interaction.response.send_message("Spelet är slut.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        async with game.lock:
+            if games.get(self.channel_id) is not game or game.pending_vote is not self:
+                await send_private(interaction, "Den här omröstningen är inte längre aktiv.")
+                return
+            if game.round_id != self.round_id or game.seq != self.seq or game.finished:
+                await cancel_pending_vote(game, "Omröstningen avbröts eftersom spelet ändrades.")
+                await send_private(interaction, "Spelet ändrades; omröstningen avbröts.")
+                return
+            uid = interaction.user.id
+            if uid not in game.players:
+                await send_private(interaction, "Du är inte med i det här spelet.")
+                return
+            if uid in self.votes:
+                await send_private(interaction, "Du har redan röstat.")
+                return
+            self.votes[uid] = approve
+            if len(self.votes) == len(game.players):
+                await self._finish_locked(game, interaction.channel)
+            elif self.message is not None:
+                try:
+                    await self.message.edit(content=self.status_text(game), view=self)
+                except discord.HTTPException:
+                    logging.exception("Kunde inte uppdatera rösterna")
+                    await interaction.followup.send(
+                        "Din röst registrerades, men röstpanelen kunde inte uppdateras.",
+                        ephemeral=True,
+                    )
+                    return
+            await interaction.followup.send("Din röst är registrerad.", ephemeral=True)
+
+    async def _finish_locked(self, game: Game, channel: discord.abc.Messageable) -> None:
+        yes = sum(self.votes.values())
+        no = len(self.votes) - yes
+        approved = yes > no
+        game.pending_vote = None
+        self.stop()
+        out: Outcome | None = None
+        if approved:
+            out = game.reveal_drawn_card(self.seq)
+            if not out.ok:
+                result = f"Omröstningen avbröts: {out.private}"
+            else:
+                result = f"Omröstningen godkändes ({yes} ja, {no} nej)."
+        else:
+            result = f"Förslaget avslogs ({yes} ja, {no} nej)."
+        if self.message is not None:
+            try:
+                await self.message.edit(content=result, view=None)
+            except discord.HTTPException:
+                logging.exception("Kunde inte uppdatera det avslutade röstmeddelandet")
+        if approved and out is not None and out.ok:
+            await after_event(game, channel, out.event)
+
+    async def on_timeout(self) -> None:
+        game = games.get(self.channel_id)
+        if game is None or self.message is None:
+            return
+        async with game.lock:
+            if games.get(self.channel_id) is not game or game.pending_vote is not self:
+                return
+            if game.round_id != self.round_id or game.seq != self.seq or game.finished:
+                await cancel_pending_vote(game, "Omröstningen avbröts eftersom spelet ändrades.")
+                return
+            await self._finish_locked(game, self.message.channel)
+
+    @discord.ui.button(label="Ja", style=discord.ButtonStyle.success)
+    async def vote_yes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._cast(interaction, True)
+
+    @discord.ui.button(label="Nej", style=discord.ButtonStyle.danger)
+    async def vote_no(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._cast(interaction, False)
 
 
 class HandView(discord.ui.View):
@@ -360,9 +616,9 @@ class HandView(discord.ui.View):
         except discord.HTTPException:
             pass
 
-    def __init__(self, channel_id: int, hand: list, page: int):
+    def __init__(self, channel_id: int, hand: list, page: int, round_id: str, seq: int):
         super().__init__(timeout=900)
-        self.channel_id, self.page = channel_id, page
+        self.channel_id, self.page, self.round_id, self.seq = channel_id, page, round_id, seq
         pages = math.ceil(len(hand) / 25)
 
         chunk = hand[page * 25:(page + 1) * 25]
@@ -392,15 +648,27 @@ class HandView(discord.ui.View):
         if game is None:
             await interaction.response.edit_message(content="Spelet är slut.", attachments=[], view=None)
             return
-        uid = interaction.user.id
-        out: Outcome = {
-            "play": lambda: game.play(uid, card_id),
-            "draw": lambda: game.draw(uid),
-            "pass": lambda: game.pass_turn(uid),
-        }[action]()
-        await refresh_hand(interaction, game, self.page, out.private)
-        if out.event:
-            await after_event(game, interaction.channel, out.event, skip=uid)
+        await interaction.response.defer()
+        async with game.lock:
+            if games.get(self.channel_id) is not game or game.round_id != self.round_id:
+                await interaction.edit_original_response(
+                    content="Den här handen tillhör en äldre runda. Tryck Visa min hand igen.",
+                    attachments=[],
+                    view=None,
+                )
+                return
+            if game.seq != self.seq:
+                await refresh_hand(interaction, game, self.page, "Spelet ändrades; handen har uppdaterats.")
+                return
+            uid = interaction.user.id
+            out: Outcome = {
+                "play": lambda: game.play(uid, card_id),
+                "draw": lambda: game.draw(uid),
+                "pass": lambda: game.pass_turn(uid),
+            }[action]()
+            await refresh_hand(interaction, game, self.page, out.private)
+            if out.event:
+                await after_event(game, interaction.channel, out.event, skip=uid)
 
     async def on_select(self, interaction: discord.Interaction):
         await self._act(interaction, "play", interaction.data["values"][0])
@@ -416,7 +684,16 @@ class HandView(discord.ui.View):
         if game is None:
             await interaction.response.edit_message(content="Spelet är slut.", attachments=[], view=None)
             return
-        await refresh_hand(interaction, game, self.page + delta, "")
+        await interaction.response.defer()
+        async with game.lock:
+            if games.get(self.channel_id) is not game or game.round_id != self.round_id:
+                await interaction.edit_original_response(
+                    content="Den här handen tillhör en äldre runda. Tryck Visa min hand igen.",
+                    attachments=[],
+                    view=None,
+                )
+                return
+            await refresh_hand(interaction, game, self.page + delta, "")
 
     async def on_prev(self, interaction: discord.Interaction):
         await self._turn_page(interaction, -1)
@@ -462,17 +739,42 @@ mao = app_commands.Group(name="mao", description="Kortspelet Mao", guild_only=Tr
 
 @mao.command(name="ny", description="Skapa ett nytt spel i den här kanalen (du blir regelhållare)")
 async def ny(interaction: discord.Interaction):
-    old = find_game(interaction)
-    if old and old.started and not old.finished:
-        await interaction.response.send_message("Det pågår redan ett spel här. Avsluta med `/mao slut`.", ephemeral=True)
-        return
-    game = Game(channel_id=interaction.channel_id, host_id=interaction.user.id)
-    game.add_player(interaction.user.id, interaction.user.display_name)
-    games[interaction.channel_id] = game
-    await interaction.response.send_message(
+    await interaction.response.defer(ephemeral=True)
+    async with game_creation_lock:
+        old = find_game(interaction)
+        if old and not old.finished:
+            message = (
+                "Det pågår redan ett spel här. Avsluta med `/mao slut`."
+                if old.started
+                else "Det finns redan en lobby här. Gå med med `/mao delta` eller avsluta den med `/mao slut`."
+            )
+            await send_private(interaction, message)
+            return
+        if old:
+            async with old.lock:
+                if games.get(interaction.channel_id) is not old:
+                    await send_private(interaction, "Spelet ändrades. Försök igen.")
+                    return
+                if not old.finished:
+                    message = (
+                        "Det pågår redan ett spel här. Avsluta med `/mao slut`."
+                        if old.started
+                        else "Det finns redan en lobby här. Gå med med `/mao delta` eller avsluta den med `/mao slut`."
+                    )
+                    await send_private(interaction, message)
+                    return
+                game = Game(channel_id=interaction.channel_id, host_id=interaction.user.id)
+                game.add_player(interaction.user.id, interaction.user.display_name)
+                games[interaction.channel_id] = game
+        else:
+            game = Game(channel_id=interaction.channel_id, host_id=interaction.user.id)
+            game.add_player(interaction.user.id, interaction.user.display_name)
+            games[interaction.channel_id] = game
+    await interaction.channel.send(
         f"🃏 **Mao!** {interaction.user.mention} är regelhållare.\n"
         "Skriv `/mao delta` för att vara med. När alla är här skriver regelhållaren `/mao starta`."
     )
+    await interaction.edit_original_response(content="Ny lobby skapad.")
 
 
 @mao.command(name="delta", description="Gå med i spelet")
@@ -496,19 +798,29 @@ async def starta(interaction: discord.Interaction, kort: app_commands.Range[int,
     if game is None or interaction.user.id not in game.keepers:
         await interaction.response.send_message("Bara regelhållaren kan starta, och det måste finnas ett spel.", ephemeral=True)
         return
-    error = game.start(kort)
-    if error:
-        await interaction.response.send_message(error, ephemeral=True)
-        return
-    await interaction.response.send_message(
-        "Korten är utdelade!\n"
-        f"Så sitter ni i cirkeln: {game.order_text(with_counts=False)}\n"
-        "Högen är tom från början; en spelare lägger första kortet från sin hand. "
-        "Ni avgör själva vems tur det är och vad som är rätt. Alla spelare kan döma. "
-        "Tryck på **Visa min hand** nedan."
-    )
-    await post_table(game, interaction.channel)
-    await refresh_all_hands(game)
+    await interaction.response.defer(ephemeral=True)
+    async with game.lock:
+        if games.get(interaction.channel_id) is not game:
+            await send_private(interaction, "Spelet har ersatts. Starta från det aktuella spelet.")
+            return
+        if game.started and not game.finished:
+            await send_private(interaction, "En runda pågår redan.")
+            return
+        await cancel_pending_vote(game, "Omröstningen avbröts eftersom en ny runda startade.")
+        error = game.start(kort)
+        if error:
+            await send_private(interaction, error)
+            return
+        await interaction.channel.send(
+            "Korten är utdelade!\n"
+            f"Så sitter ni i cirkeln: {game.order_text(with_counts=False)}\n"
+            "Högen är tom från början; en spelare lägger första kortet från sin hand. "
+            "Ni avgör själva vems tur det är och vad som är rätt. Alla spelare kan döma. "
+            "Tryck på **Visa min hand** nedan."
+        )
+        await post_table(game, interaction.channel)
+        await refresh_all_hands(game)
+        await interaction.edit_original_response(content="Rundan har startat.")
 
 
 @mao.command(name="slut", description="Avsluta spelet (regelhållare)")
@@ -517,13 +829,19 @@ async def slut(interaction: discord.Interaction):
     if game is None or interaction.user.id not in game.keepers:
         await interaction.response.send_message("Bara regelhållaren kan avsluta spelet.", ephemeral=True)
         return
-    if game.table_msg is not None:
-        try:
-            await game.table_msg.delete()
-        except discord.HTTPException:
-            pass
-    del games[interaction.channel_id]
-    await interaction.response.send_message("Spelet är avslutat. Starta ett nytt med `/mao ny`.")
+    await interaction.response.defer()
+    async with game.lock:
+        if games.get(interaction.channel_id) is not game:
+            await send_private(interaction, "Spelet har redan avslutats eller ersatts.")
+            return
+        await cancel_pending_vote(game, "Omröstningen avbröts eftersom spelet avslutades.")
+        if game.table_msg is not None:
+            try:
+                await game.table_msg.delete()
+            except discord.HTTPException:
+                logging.exception("Kunde inte ta bort bordsmeddelandet när spelet avslutades")
+        del games[interaction.channel_id]
+        await interaction.edit_original_response(content="Spelet är avslutat. Starta ett nytt med `/mao ny`.")
 
 
 bot.tree.add_command(mao)
