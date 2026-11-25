@@ -6,9 +6,11 @@ straffkort, med möjlighet att ta tillbaka det senaste draget.
 """
 from __future__ import annotations
 
+import asyncio
 import random
 from dataclasses import dataclass, field
 from typing import Any
+from uuid import uuid4
 
 SUITS = "SHDC"  # spader, hjärter, ruter, klöver
 SYMBOLS = {"S": "♠", "H": "♥", "D": "♦", "C": "♣"}
@@ -89,9 +91,12 @@ class Game:
     effects: dict[str, str] = field(default_factory=dict)  # valör -> effekt
     last: LastAction | None = None
     seq: int = 0  # räknas upp vid varje drag; knappar på gamla bordsmeddelanden blir ogiltiga
+    round_id: str = field(default_factory=lambda: uuid4().hex)
     last_judgment: LastJudgment | None = None
+    pending_vote: Any = field(default=None, repr=False)
     table_msg: Any = None  # senaste bordsmeddelandet i Discord
     hand_ix: dict[int, tuple[Any, int]] = field(default_factory=dict)  # spelare -> (interaction, sida) för live-uppdatering
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     def __post_init__(self) -> None:
         self.keepers.add(self.host_id)
@@ -106,6 +111,8 @@ class Game:
 
     def start(self, cards_each: int = 5) -> str | None:
         """Blandar cirkelns ordning, delar ut och startar en runda. Returnerar felmeddelande eller None."""
+        if self.started and not self.finished:
+            return "En runda pågår redan."
         if len(self.players) < 2:
             return "Det behövs minst två spelare."
         decks = 1 if len(self.players) * cards_each <= 26 else 2
@@ -120,6 +127,8 @@ class Game:
         self.started, self.finished, self.winner = True, False, None
         self.last = None
         self.last_judgment = None
+        self.pending_vote = None
+        self.round_id = uuid4().hex
         self.seq += 1
         return None
 
@@ -162,6 +171,20 @@ class Game:
             self.hands[uid].append(card)
             drawn.append(card)
         return drawn
+
+    def reveal_drawn_card(self, expected_seq: int) -> Outcome:
+        if not self.started or self.finished:
+            return Outcome(False, private="Det finns ingen aktiv runda.")
+        if expected_seq != self.seq:
+            return Outcome(False, private="Spelet har ändrats; omröstningen är inte längre aktuell.")
+        if not self.draw_pile:
+            self._refill_draw_pile()
+        card = self.draw_pile.pop()
+        self.pile.append(card)
+        self.last = None
+        self.last_judgment = None
+        self.seq += 1
+        return Outcome(True, event=f"Omröstningen godkändes. Ett nytt kort vändes upp: **{card.label}**.")
 
     def _active(self, uid: int) -> bool:
         return self.started and not self.finished and uid in self.players
@@ -230,7 +253,9 @@ class Game:
 
     # ---------- handlingar ----------
     def penalty(self, uid: int, judge_uid: int, reason: str) -> Outcome:
-        if not self.started or uid not in self.players or judge_uid not in self.players:
+        if not self.started or self.finished:
+            return Outcome(False, private="Inget pågående spel.")
+        if uid not in self.players or judge_uid not in self.players:
             return Outcome(False, private="Både den som dömer och spelaren som straffas måste vara med.")
         snapshot = self._judgment_snapshot(judge_uid, reason)
         refilled = not self.draw_pile
@@ -241,8 +266,6 @@ class Game:
         if refilled:
             snapshot.refill_draw_pile = list(self.draw_pile)
             snapshot.refill_pile = list(self.pile)
-        if uid == self.winner:
-            self.finished, self.winner = False, None
         self.last, self.seq = None, self.seq + 1
         self.last_judgment = snapshot
         return Outcome(
