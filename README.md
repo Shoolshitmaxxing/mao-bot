@@ -1,4 +1,4 @@
-[Uploading README.md…]()
+[README.md](https://github.com/user-attachments/files/35435323/README.md)
 # Mao-bot (prototyp)
 
 Discord-bot för att spela Mao på distans, i text. Boten sköter korten, högen och straffkorten,
@@ -10,16 +10,17 @@ men **ni avgör själva vems tur det är**. Boten visar bara hur ni "sitter i ci
   den översta kortet och ordningen med antal kort kvar.
 - Högen börjar tom. En spelare lägger det första kortet från sin hand.
 - När draghögen tar slut blandas 52 nya kort med korten under översta kortet. Översta kortet ligger kvar.
-- Använd `/mao hand` för att öppna din privata hand. Där väljer du kort i dropdown-menyn, eller
-  trycker **Dra kort** / **Passa**. Den privata handen uppdateras automatiskt när kort spelas eller straff delas ut.
+- **Föreslå nytt kort** startar en omröstning. Den som föreslår räknas automatiskt som ja-röst. Alla andra kan rösta ja eller nej; omröstningen avslutas när alla har röstat eller efter 20 sekunder. Fler ja än nej bland rösterna krävs. Vid godkänt förslag vänds ett kort från draghögen upp på högen. Om spelet ändras under omröstningen avbryts den.
+- Tryck **Visa min hand** under bordsmeddelandet. Där väljer du kort i dropdown-menyn, eller
+  trycker **Dra kort** / **Passa**. Handen uppdateras live när något händer (t.ex. straffkort).
 - **Boten dömer aldrig själv.** Du kan lägga vilket kort som helst när som helst. Alla spelare
   kan bedöma om ett drag är fel.
-- Under bordsmeddelandet har alla spelare knapparna **⚠️ Inte din tur**, **🗣️ Pratade** och **⚠️ Straff**.
+- Under bordsmeddelandet har alla spelare knapparna **⚠️ Inte din tur**, **🗣️ Pratade**, **⚠️ Straff** och **Föreslå nytt kort**.
   **Pratade** låter dig välja spelare och ger ett straffkort utan att ta tillbaka kort.
   **Straff** låter dig välja spelare, skriva en egen anledning och välja om spelarens senast lagda kort ska tas tillbaka.
   Kortet kan bara tas tillbaka från den som lade det senast. **Inte din tur** gäller automatiskt senaste spelaren och tar tillbaka kortet.
   Du kan också döma eller straffa dig själv.
-- En **Felbedömning**-knapp under bordsmeddelandet ångrar den senaste dömningen, inklusive kort och straffkort. Kortet flyttas till den som dömde fel i stället för att dra ett nytt. Även en felbedömning kan felbedömas, då går kortet tillbaka till den andra spelaren. Knappen visas efter en vinst och tar tillbaka vinnarens sista kort.
+- En **Felbedömning**-knapp under bordsmeddelandet ångrar den senaste dömningen, inklusive kort och straffkort. Straffkortet som redan delats ut flyttas till den som dömde; inget extra kort dras. Även en felbedömning kan felbedömas. Knappen visas efter en vinst: den tar tillbaka vinnarens sista kort och ger spelaren ett straffkort. Om vinstinvändningen var felaktig kan den också felbedömas, vilket flyttar samma kort vidare.
 
 ## Kommandon
 | Kommando | Vem | Vad |
@@ -27,7 +28,6 @@ men **ni avgör själva vems tur det är**. Boten visar bara hur ni "sitter i ci
 | `/mao ny` | alla | Skapar ett spel i kanalen, du blir regelhållare |
 | `/mao delta` | spelare | Gå med |
 | `/mao starta [kort]` | regelhållare | Delar ut (standard 5 kort) och slumpar ordningen |
-| `/mao hand` | spelare | Visa din hand privat; handen uppdateras automatiskt efter spel och straff |
 | `/mao slut` | regelhållare | Avsluta spelet |
 
 ## 1. Skapa boten
@@ -82,7 +82,9 @@ journalctl -u mao-bot -f                 # loggar
 
 ## Känt i prototypen
 - Spelet ligger i minnet: startar du om boten försvinner pågående spel.
+- `/mao starta` kan inte starta om en runda som redan pågår; avsluta först med `/mao slut`.
 - Handvyn är ett privat (ephemeral) meddelande. Discord kan inte fästa sådana längst ner, och
-  live-uppdateringen fungerar i ca 15 minuter efter ditt senaste klick. Därefter: använd `/mao hand` igen.
+  live-uppdateringen fungerar i ca 15 minuter efter ditt senaste klick. Därefter: **Visa min hand** igen.
+- Spelhandlingar behandlas en i taget. Om ett annat drag hinner uppdatera spelet avvisas ett gammalt handklick och handen uppdateras; välj kortet igen.
 - Dropdown-menyn rymmer 25 kort per sida; fler visas med ◀ ▶.
 - Ett spel per kanal.
